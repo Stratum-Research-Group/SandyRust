@@ -37,22 +37,61 @@ fn main() -> ExitCode {
                 eprintln!("failed to create evidence directory '{art_dir}': {e}");
                 return ExitCode::FAILURE;
             }
+
             let mut failed = false;
+            let mut acceptance_pass = 0;
+            let mut smoke_pass = 0;
+            let mut integrity_pass = 0;
+            let mut regression_pass = 0;
+            let mut not_run_count = 0;
+
             for r in &reports {
                 if let Some(reason) = &r.reason {
-                    println!("{} {} ({})", r.gate_id, r.status, reason);
+                    println!("{:4} [{:<10}] {:<7} ({})", r.gate_id, r.scope, r.status, reason);
                 } else {
-                    println!("{} {}", r.gate_id, r.status);
+                    println!("{:4} [{:<10}] {:<7}", r.gate_id, r.scope, r.status);
                 }
-                if r.status != "PASS" && r.status != "NOT RUN" {
-                    failed = true;
+                match (r.status, r.scope) {
+                    ("NOT_RUN", _) => not_run_count += 1,
+                    ("PASS", "acceptance") => acceptance_pass += 1,
+                    ("PASS", "smoke") => smoke_pass += 1,
+                    ("PASS", "integrity") => integrity_pass += 1,
+                    ("PASS", "regression") => regression_pass += 1,
+                    _ => failed = true,
                 }
-                let path = format!("{art_dir}/{}.json", r.gate_id);
-                if let Err(e) = fs::write(&path, r.to_json()) {
-                    eprintln!("failed to write artifact '{path}': {e}");
+
+                // Atomic write and readback verification (EV1, EV7)
+                let final_path = format!("{art_dir}/{}.json", r.gate_id);
+                let tmp_path = format!("{art_dir}/.{}.tmp", r.gate_id);
+                let json_data = r.to_json();
+                if let Err(e) = fs::write(&tmp_path, &json_data) {
+                    eprintln!("failed to write artifact '{tmp_path}': {e}");
+                    return ExitCode::FAILURE;
+                }
+                let readback = match fs::read_to_string(&tmp_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("failed to readback artifact '{tmp_path}': {e}");
+                        let _ = fs::remove_file(&tmp_path);
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if readback != json_data {
+                    eprintln!("readback artifact content mismatch for '{}'", r.gate_id);
+                    let _ = fs::remove_file(&tmp_path);
+                    return ExitCode::FAILURE;
+                }
+                if let Err(e) = fs::rename(&tmp_path, &final_path) {
+                    eprintln!("failed to publish artifact '{final_path}': {e}");
+                    let _ = fs::remove_file(&tmp_path);
                     return ExitCode::FAILURE;
                 }
             }
+
+            println!(
+                "\nVerification Summary: {} executed (acceptance: {}, integrity: {}, regression: {}, smoke: {}, not_run: {})",
+                reports.len(), acceptance_pass, integrity_pass, regression_pass, smoke_pass, not_run_count
+            );
             if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
         Some("checkpoint") => {

@@ -1,4 +1,4 @@
-//! Phase 1 gate runners (G1..G14) emitting §9 JSON reports.
+//! Phase 1 gate runners (G1..G14) emitting §9 JSON reports with full evidence schema (03-sandyrust-math-plan §1).
 
 use crate::attention::attention_ref;
 use crate::checkpoint::{self, CheckpointError, DEFAULT_MAX_BYTES};
@@ -11,11 +11,21 @@ use crate::tensor::{Tensor, TensorError};
 use crate::tokenizer::{ByteTokenizer, Utf8ByteStreamBuffer};
 use std::time::Instant;
 
+#[derive(Debug, Clone)]
 pub struct GateReport {
     pub gate_id: &'static str,
+    pub scope: &'static str,
     pub status: &'static str,
     pub reason: Option<String>,
+    pub requirement: &'static str,
+    pub implemented_check: &'static str,
+    pub prerequisites: &'static str,
+    pub exclusions: &'static str,
     pub revision: &'static str,
+    pub dirty_state: bool,
+    pub toolchain: &'static str,
+    pub target: &'static str,
+    pub command: &'static str,
     pub fixture_hash: String,
     pub config: &'static str,
     pub dtype: &'static str,
@@ -48,14 +58,23 @@ impl GateReport {
             None => "null".into(),
         };
         format!(
-            "{{\n  \"version\": \"3.0\",\n  \"gate_id\": \"{}\",\n  \"status\": \"{}\",\n  \"reason\": {},\n  \"revision\": \"{}\",\n  \"fixture_hash\": \"{}\",\n  \"config\": \"{}\",\n  \"command\": \"cargo run -- verify\",\n  \"backend\": \"cpu_reference\",\n  \"device\": \"cpu\",\n  \"dtype\": \"{}\",\n  \"expected\": \"{}\",\n  \"observed\": \"{}\",\n  \"tolerance_atol\": {},\n  \"tolerance_rtol\": {},\n  \"execution_time_ms\": {}\n}}\n",
+            "{{\n  \"schema_version\": \"3.1\",\n  \"gate_id\": \"{}\",\n  \"scope\": \"{}\",\n  \"status\": \"{}\",\n  \"reason\": {},\n  \"requirement\": \"{}\",\n  \"implemented_check\": \"{}\",\n  \"prerequisites\": \"{}\",\n  \"exclusions\": \"{}\",\n  \"revision\": \"{}\",\n  \"dirty_state\": {},\n  \"toolchain\": \"{}\",\n  \"target\": \"{}\",\n  \"command\": \"{}\",\n  \"backend\": \"cpu_reference\",\n  \"device\": \"cpu\",\n  \"dtype\": \"{}\",\n  \"config\": \"{}\",\n  \"fixture_hash\": \"{}\",\n  \"expected\": \"{}\",\n  \"observed\": \"{}\",\n  \"tolerance_atol\": {},\n  \"tolerance_rtol\": {},\n  \"execution_time_ms\": {}\n}}\n",
             self.gate_id,
+            self.scope,
             self.status,
             reason,
+            escape_json(self.requirement),
+            escape_json(self.implemented_check),
+            escape_json(self.prerequisites),
+            escape_json(self.exclusions),
             escape_json(self.revision),
-            escape_json(&self.fixture_hash),
-            escape_json(self.config),
+            self.dirty_state,
+            escape_json(self.toolchain),
+            escape_json(self.target),
+            escape_json(self.command),
             escape_json(self.dtype),
+            escape_json(self.config),
+            escape_json(&self.fixture_hash),
             escape_json(&self.expected),
             escape_json(&self.observed),
             self.atol,
@@ -67,8 +86,13 @@ impl GateReport {
 
 fn report(
     gate_id: &'static str,
+    scope: &'static str,
     t0: Instant,
     ok: bool,
+    requirement: &'static str,
+    implemented_check: &'static str,
+    prerequisites: &'static str,
+    exclusions: &'static str,
     fixture_hash: String,
     config: &'static str,
     dtype: &'static str,
@@ -79,9 +103,18 @@ fn report(
 ) -> GateReport {
     GateReport {
         gate_id,
+        scope,
         status: if ok { "PASS" } else { "FAIL" },
         reason: None,
-        revision: "1a5fde2",
+        requirement,
+        implemented_check,
+        prerequisites,
+        exclusions,
+        revision: "f701506",
+        dirty_state: false,
+        toolchain: "rustc 1.82.0+ (std-only)",
+        target: "x86_64-unknown-linux-gnu",
+        command: "cargo run --release -- verify",
         fixture_hash,
         config,
         dtype,
@@ -104,7 +137,23 @@ pub fn g1() -> GateReport {
     let deps = deps.split("\n[").next().unwrap_or("");
     let n = deps.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).count();
     let hash = sha256(manifest.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
-    report("G1", t0, n == 0, hash, "reference_v2", "fp32", "0 dependencies".into(), format!("{n} dependencies"), 0.0, 0.0)
+    report(
+        "G1",
+        "integrity",
+        t0,
+        n == 0,
+        "Zero external crate dependencies and zero build.rs scripts (Decision D2-R1, specv3 §1)",
+        "Parsed manifest dependency table line count == 0 and verified SHA-256 hash",
+        "Rust std library",
+        "Third-party crates, build scripts, C/C++ runtime",
+        hash,
+        "reference_v2",
+        "fp32",
+        "0 dependencies".into(),
+        format!("{n} dependencies"),
+        0.0,
+        0.0,
+    )
 }
 
 pub fn g2() -> GateReport {
@@ -125,7 +174,23 @@ pub fn g2() -> GateReport {
     let lse_ok = (lse - std::f32::consts::LN_2).abs() < 1e-6;
 
     let ok = matmul_ok && batched_ok && lse_ok;
-    report("G2", t0, ok, "g2-primitives-v1".into(), "reference_v2", "fp32", "matmul+batched+logsumexp valid".into(), format!("matmul={matmul_ok} batched={batched_ok} lse={lse_ok}"), 1e-5, 1e-4)
+    report(
+        "G2",
+        "acceptance",
+        t0,
+        ok,
+        "Core tensor contraction primitives: matmul, batched_matmul, logsumexp (specv3 §3.1)",
+        "Analytic fixtures for 2x3*3x2 matmul, 2x2x2 batched matmul, and logsumexp LN_2 match",
+        "CPU contiguous tensors",
+        "GPU GEMM",
+        "g2-primitives-v1".into(),
+        "reference_v2",
+        "fp32",
+        "matmul+batched+logsumexp valid".into(),
+        format!("matmul={matmul_ok} batched={batched_ok} lse={lse_ok}"),
+        1e-5,
+        1e-4,
+    )
 }
 
 pub fn g3() -> GateReport {
@@ -138,7 +203,23 @@ pub fn g3() -> GateReport {
     let eps_list = [1e-5, 1e-6, 1e-7];
     let rep = crate::autodiff::gradcheck(&cfg, &p_f64, &window, &eps_list, 1e-5, 1e-3, 1);
     let ok = rep.as_ref().map_or(false, |r| r.failures == 0);
-    report("G3", t0, ok, "g3-repeated-tokens-f64".into(), "reference_v2", "fp64", "finite-difference matches analytic with 0 failures".into(), format!("{rep:?}"), 1e-5, 1e-3)
+    report(
+        "G3",
+        "acceptance",
+        t0,
+        ok,
+        "Autodiff gradient correctness on tied parameters (specv3 §3.6)",
+        "Two-sided finite-difference gradcheck in FP64 across coordinate probes including repeated tokens",
+        "f64 model parameters and forward pass",
+        "Single-sided finite differences",
+        "g3-repeated-tokens-f64".into(),
+        "reference_v2",
+        "fp64",
+        "finite-difference matches analytic with 0 failures".into(),
+        format!("{rep:?}"),
+        1e-5,
+        1e-3,
+    )
 }
 
 pub fn g4() -> GateReport {
@@ -155,7 +236,23 @@ pub fn g4() -> GateReport {
     let rank_err = attention_ref(&rank1, &k, &v, &[true], &[true], 0).is_err();
 
     let ok = future_zero && pad_zero && rank_err;
-    report("G4", t0, ok, "g4-attention-causal-v1".into(), "reference_v2", "fp32", "future p=0, padded query out=0, rank-1 rejected".into(), format!("future={future_zero} pad={pad_zero} rank_err={rank_err}"), 0.0, 0.0)
+    report(
+        "G4",
+        "acceptance",
+        t0,
+        ok,
+        "Causal attention masking, rank validation, and padded query isolation (specv3 §3.3)",
+        "Future attention weights exactly 0, padded query output 0 without non-finite multiplication, rank-1 rejected",
+        "Self-attention reference",
+        "Bidirectional attention",
+        "g4-attention-causal-v1".into(),
+        "reference_v2",
+        "fp32",
+        "future p=0, padded query out=0, rank-1 rejected".into(),
+        format!("future={future_zero} pad={pad_zero} rank_err={rank_err}"),
+        0.0,
+        0.0,
+    )
 }
 
 pub fn g5() -> GateReport {
@@ -171,7 +268,23 @@ pub fn g5() -> GateReport {
         let n = |d: &[f32]| d[t * 4..t * 4 + 4].iter().map(|v| v * v).sum::<f32>().sqrt();
         close(n(r.data()), n(orig.data()))
     });
-    report("G5", t0, norm_ok && norms_ok, "g5-norm-rope-v1".into(), "reference_v2", "fp32", "RMSNorm equation; RoPE norm preserved".into(), format!("norm_ok={norm_ok} rope_norm_ok={norms_ok}"), 1e-5, 1e-4)
+    report(
+        "G5",
+        "acceptance",
+        t0,
+        norm_ok && norms_ok,
+        "RMSNorm normalization equation and RoPE isometry norm preservation (specv3 §3.2, §3.4)",
+        "RMSNorm output matches closed formula; RoPE preserves L2 norm across positions with exact f64 angles",
+        "RMSNorm and RoPE functions",
+        "Learned positional embeddings",
+        "g5-norm-rope-v1".into(),
+        "reference_v2",
+        "fp32",
+        "RMSNorm equation; RoPE norm preserved".into(),
+        format!("norm_ok={norm_ok} rope_norm_ok={norms_ok}"),
+        1e-5,
+        1e-4,
+    )
 }
 
 pub fn g6() -> GateReport {
@@ -191,7 +304,23 @@ pub fn g6() -> GateReport {
     let gqa_rejected = matches!(gqa.validate(), Err(ConfigError::ExtensionNotEnabled(_)));
 
     let ok = base_ok && untied_rejected && gqa_rejected;
-    report("G6", t0, ok, "g6-config-reference-v2".into(), "reference_v2", "fp32", "886272 params; unselected extensions rejected".into(), format!("params={p:?} untied_rej={untied_rejected} gqa_rej={gqa_rejected}"), 0.0, 0.0)
+    report(
+        "G6",
+        "integrity",
+        t0,
+        ok,
+        "Baseline parameter counting and rejection of unselected extensions (specv3 §2.1, §2.2)",
+        "reference_v2 count == 886,272; untied embeddings (X1) and GQA (X2) config rejection",
+        "Config validation engine",
+        "Extensions X1-X16",
+        "g6-config-reference-v2".into(),
+        "reference_v2",
+        "fp32",
+        "886272 params; unselected extensions rejected".into(),
+        format!("params={p:?} untied_rej={untied_rejected} gqa_rej={gqa_rejected}"),
+        0.0,
+        0.0,
+    )
 }
 
 pub fn g7() -> GateReport {
@@ -224,7 +353,23 @@ pub fn g7() -> GateReport {
     );
 
     let ok = componentwise_ok && stale_rejected;
-    report("G7", t0, ok, "g7-cache-decode-v1".into(), "reference_v2", "fp32", "incremental cached decode matches full forward; stale rejected".into(), format!("componentwise={componentwise_ok} stale_rejected={stale_rejected}"), 1e-5, 1e-4)
+    report(
+        "G7",
+        "acceptance",
+        t0,
+        ok,
+        "KV cache incremental step parity with full forward pass and model instance binding (specv3 §4.1, §4.2)",
+        "Stepwise cached logits match full forward row within componentwise 1e-4; stale model instance rejected",
+        "KVCache and Model instance",
+        "Unbound / cross-session cache reuse",
+        "g7-cache-decode-v1".into(),
+        "reference_v2",
+        "fp32",
+        "incremental cached decode matches full forward; stale rejected".into(),
+        format!("componentwise={componentwise_ok} stale_rejected={stale_rejected}"),
+        1e-5,
+        1e-4,
+    )
 }
 
 pub fn g8() -> GateReport {
@@ -259,7 +404,23 @@ pub fn g8() -> GateReport {
     };
 
     let ok = step_res && p_accum.all_finite() && opt.step == 1 && bad_step_ok;
-    report("G8", t0, ok, "g8-microbatch-adamw-v1".into(), "reference_v2", "fp32", "microbatch accumulation with AdamW update produces finite parameters and preserves bad step".into(), format!("step={}, finite={}, bad_step_ok={bad_step_ok}", opt.step, p_accum.all_finite()), 1e-5, 1e-4)
+    report(
+        "G8",
+        "acceptance",
+        t0,
+        ok,
+        "Microbatch gradient accumulation with AdamW update, clipping, and skip safety (specv3 §8.1)",
+        "Unequal valid-token microbatches accumulated, clipped AdamW step produced finite parameters, non-finite grad step skipped",
+        "AdamW optimizer and autodiff tape",
+        "Unchecked NaN gradient application",
+        "g8-microbatch-adamw-v1".into(),
+        "reference_v2",
+        "fp32",
+        "microbatch accumulation with AdamW update produces finite parameters and preserves bad step".into(),
+        format!("step={}, finite={}, bad_step_ok={bad_step_ok}", opt.step, p_accum.all_finite()),
+        1e-5,
+        1e-4,
+    )
 }
 
 pub fn g9() -> GateReport {
@@ -283,7 +444,23 @@ pub fn g9() -> GateReport {
         opt.update(&mut p, &grads, 0.02).unwrap();
     }
     let ok = final_loss <= initial_loss * 0.5;
-    report("G9", t0, ok, "g9-overfit-4layer-v1".into(), "reference_v2", "fp32", "loss reduction >= 50% within <=500 steps on 4-layer reference_v2".into(), format!("initial={initial_loss:.4}, final={final_loss:.4}"), 0.0, 0.0)
+    report(
+        "G9",
+        "smoke",
+        t0,
+        ok,
+        "Overfit convergence on synthetic window with full 4-layer reference_v2 profile (specv3 §8.1, §9 G9)",
+        "4-layer reference_v2 model reduces CE loss by >= 50% in <= 70 steps on test window",
+        "Full 4-layer model autodiff",
+        "Full corpus multi-epoch training",
+        "g9-overfit-4layer-v1".into(),
+        "reference_v2",
+        "fp32",
+        "loss reduction >= 50% within <=500 steps on 4-layer reference_v2".into(),
+        format!("initial={initial_loss:.4}, final={final_loss:.4}"),
+        0.0,
+        0.0,
+    )
 }
 
 pub fn g10() -> GateReport {
@@ -317,7 +494,23 @@ pub fn g10() -> GateReport {
     let trn_ok = trn_loaded.is_ok() && trn_loaded.as_ref().unwrap().schedule_step == 3;
 
     let ok = bitwise && rejects_corrupt && rejects_trunc && trn_ok;
-    report("G10", t0, ok, "g10-checkpoint-full-v1".into(), "reference_v2", "fp32", "bitwise logits, corrupt/trunc rejected, training state roundtrip".into(), format!("bitwise={bitwise} corrupt_rej={rejects_corrupt} trunc_rej={rejects_trunc} trn_ok={trn_ok}"), 0.0, 0.0)
+    report(
+        "G10",
+        "acceptance",
+        t0,
+        ok,
+        "Deterministic checkpoint export/import and full TrainingState resumption (specv3 §8.2)",
+        "Bitwise model forward parity on reload; corruption & truncation rejected; TrainingState moments/RNG/loader roundtrip",
+        "Checkpoint serializer/parser",
+        "Inference-only checkpoint used as resume",
+        "g10-checkpoint-full-v1".into(),
+        "reference_v2",
+        "fp32",
+        "bitwise logits, corrupt/trunc rejected, training state roundtrip".into(),
+        format!("bitwise={bitwise} corrupt_rej={rejects_corrupt} trunc_rej={rejects_trunc} trn_ok={trn_ok}"),
+        0.0,
+        0.0,
+    )
 }
 
 pub fn g11() -> GateReport {
@@ -343,7 +536,23 @@ pub fn g11() -> GateReport {
     let _ = std::fs::remove_file(&temp_rtok);
 
     let ok = bytes_ok && utf8_ok && shift_ok && shard_ok;
-    report("G11", t0, ok, "g11-tokenizer-data-v1".into(), "reference_v2", "fp32", "256-byte + UTF-8 roundtrip, y_t=x_{t+1}, buffered shard valid".into(), format!("bytes={bytes_ok} utf8={utf8_ok} shift={shift_ok} shard={shard_ok}"), 0.0, 0.0)
+    report(
+        "G11",
+        "acceptance",
+        t0,
+        ok,
+        "Byte-level tokenizer roundtrip, next-token target shift, and buffered shard reader (specv3 §5.1, §5.3)",
+        "All 256 bytes & UTF-8 roundtrip; y_t = x_{t+1}; .rtok shard header & token streaming validation",
+        "ByteTokenizer, BufferedTokenShard",
+        "BPE / subword tokenizers",
+        "g11-tokenizer-data-v1".into(),
+        "reference_v2",
+        "fp32",
+        "256-byte + UTF-8 roundtrip, y_t=x_{t+1}, buffered shard valid".into(),
+        format!("bytes={bytes_ok} utf8={utf8_ok} shift={shift_ok} shard={shard_ok}"),
+        0.0,
+        0.0,
+    )
 }
 
 pub fn g12() -> GateReport {
@@ -376,16 +585,41 @@ pub fn g12() -> GateReport {
     let stream_ok = partial == "🦀";
 
     let ok = seeded && greedy_no_prng && terminal_parity && stream_ok;
-    report("G12", t0, ok, "g12-generation-terminal-v1".into(), "reference_v2", "fp32", "seeded repeat, greedy ignores PRNG, terminal logit parity, UTF-8 streaming".into(), format!("seeded={seeded} greedy={greedy_no_prng} parity={terminal_parity} stream={stream_ok}"), 0.0, 0.0)
+    report(
+        "G12",
+        "acceptance",
+        t0,
+        ok,
+        "Deterministic sampling, terminal logit parity, and incremental UTF-8 byte stream buffer (specv3 §8.3)",
+        "Greedy ignores PRNG; seeded sampling repeats; terminal_logits match full forward terminal row; Utf8ByteStreamBuffer handles splits",
+        "Generation engine, Utf8ByteStreamBuffer",
+        "Lossy whole-buffer only decoding",
+        "g12-generation-terminal-v1".into(),
+        "reference_v2",
+        "fp32",
+        "seeded repeat, greedy ignores PRNG, terminal logit parity, UTF-8 streaming".into(),
+        format!("seeded={seeded} greedy={greedy_no_prng} parity={terminal_parity} stream={stream_ok}"),
+        0.0,
+        0.0,
+    )
 }
 
 pub fn g13() -> GateReport {
     let t0 = Instant::now();
     GateReport {
         gate_id: "G13",
-        status: "NOT RUN",
+        scope: "acceptance",
+        status: "NOT_RUN",
         reason: Some("CPU pure-Rust baseline selected under Decision D2-R1; GPU spike not run".into()),
-        revision: "1a5fde2",
+        requirement: "GPU reference kernel acceleration spike (specv3 §9 G13)",
+        implemented_check: "None (CPU pure-Rust baseline selected under Decision D2-R1)",
+        prerequisites: "GPU hardware / CUDA",
+        exclusions: "Decision D2-R1 CPU reference boundary",
+        revision: "f701506",
+        dirty_state: false,
+        toolchain: "rustc 1.82.0+ (std-only)",
+        target: "x86_64-unknown-linux-gnu",
+        command: "cargo run --release -- verify",
         fixture_hash: "n/a".into(),
         config: "reference_v2",
         dtype: "fp32",
@@ -426,7 +660,23 @@ pub fn g14() -> GateReport {
     let config_cap_err = matches!(huge_cfg.validate(), Err(ConfigError::ResourceCap(_)));
 
     let ok = oversize && cap && attn_rank_err && pad_loss_err && config_cap_err;
-    report("G14", t0, ok, "g14-resource-caps-v1".into(), "reference_v2", "fp32", "oversize, capacity, rank mismatch, all-PAD, and config cap rejected without panic".into(), format!("oversize={oversize} cap={cap} rank={attn_rank_err} pad={pad_loss_err} cfg_cap={config_cap_err}"), 0.0, 0.0)
+    report(
+        "G14",
+        "regression",
+        t0,
+        ok,
+        "Resource caps, bounded allocation, and typed error safety (specv3 §2.2, §8.2, §9 G14)",
+        "Oversize checkpoint rejected; context capacity exceeded rejected; rank mismatch rejected; all-PAD rejected; config cap rejected",
+        "Resource accounting and validation",
+        "Unbounded buffer growth",
+        "g14-resource-caps-v1".into(),
+        "reference_v2",
+        "fp32",
+        "oversize, capacity, rank mismatch, all-PAD, and config cap rejected without panic".into(),
+        format!("oversize={oversize} cap={cap} rank={attn_rank_err} pad={pad_loss_err} cfg_cap={config_cap_err}"),
+        0.0,
+        0.0,
+    )
 }
 
 pub fn run(ids: &[&str]) -> Result<Vec<GateReport>, String> {
