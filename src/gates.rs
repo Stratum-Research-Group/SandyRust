@@ -704,6 +704,7 @@ pub fn run(ids: &[&str]) -> Result<Vec<GateReport>, String> {
             "gx12e" => crate::generation::gx12e(),
             "gx13" => crate::hooks::gx13(),
             "gx14" => crate::eval::gx14(),
+            "gx15" => crate::adapter::gx15(),
             other => return Err(format!("unknown gate id: '{other}'")),
         };
         reports.push(rep);

@@ -10,6 +10,6 @@ Recorded 2026-10-07 as repository-declared choices for the recommended baseline 
 | D4 | Release scope | **IT.** Inference + training at tiny reference scale |
 | D5 | Resource budget | Tiny profile: 4 GiB host RAM, >=4 GiB system headroom, T=64, B=2, 4 threads, <=500 steps, <=10 MB dataset; no GPU |
 | D6 | Weight compatibility | **No.** Random seeded init, train from scratch |
-| D7 | LoRA adaptation scope | **D7-FP32 (Proposed / Deferred).** Approve plain FP32 LoRA as optional extension X15, only after base passes baseline gates and shows measured learning. QLoRA, quantized base weights, and GRPO or RL remain deferred. |
+| D7 | LoRA adaptation scope | **D7-FP32 Approved.** Plain FP32 LoRA approved as optional extension X15 (Gate GX15). Base weights remain frozen during adaptation. QLoRA, quantized base weights, and GRPO or RL remain deferred. |
 
 Consequences: extensions X1–X16 and X12-E disabled by default; GPU spike (G13) is `NOT RUN`; no external weight loading.

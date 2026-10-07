@@ -41,6 +41,7 @@ pub struct Config {
     pub ext_x13_hooks: bool,
     pub ext_x13_edit: bool,
     pub ext_x12e_entropy_sampling: bool,
+    pub ext_x15_lora: bool,
 }
 
 pub const MAX_SEQ_CAP: usize = 8192;
@@ -73,6 +74,7 @@ impl Config {
             ext_x13_hooks: false,
             ext_x13_edit: false,
             ext_x12e_entropy_sampling: false,
+            ext_x15_lora: false,
         }
     }
 
@@ -82,7 +84,7 @@ impl Config {
 
     /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
     pub fn fingerprint(&self) -> [u8; 32] {
-        let s = if !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling {
+        let s = if !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora {
             format!(
                 "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th{:.6}:eps{:.8}:bos{}:eos{}:pad{}:tied{}:seed{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
@@ -92,12 +94,12 @@ impl Config {
             )
         } else {
             format!(
-                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th{:.6}:eps{:.8}:bos{}:eos{}:pad{}:tied{}:seed{}:x13h{}:x13e{}:x12e{}",
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th{:.6}:eps{:.8}:bos{}:eos{}:pad{}:tied{}:seed{}:x13h{}:x13e{}:x12e{}:x15l{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
                 self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
                 self.batch_size, self.rope_theta, self.rms_eps,
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed,
-                self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling
+                self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora
             )
         };
         crate::sha256::sha256(s.as_bytes())

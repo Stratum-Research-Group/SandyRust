@@ -20,6 +20,10 @@ impl ByteTokenizer {
         ByteTokenizer
     }
 
+    pub fn fingerprint(&self) -> [u8; 32] {
+        crate::sha256::sha256(b"sandyrust:byte_tokenizer:v1:vocab=259")
+    }
+
     pub fn validate_config(cfg: &crate::config::Config) -> Result<(), TokenizerError> {
         if cfg.vocab_size != 259 || cfg.bos_id != 256 || cfg.eos_id != 257 || cfg.pad_id != 258 {
             return Err(TokenizerError::UnsupportedConfig);

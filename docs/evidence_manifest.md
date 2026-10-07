@@ -51,6 +51,7 @@ To prevent evidence inflation and distinguish superficial smoke tests from verif
 | **GX12E** | `acceptance` | `PASS` | Entropy-feedback adaptive sampling (`Addendum A1 §A4`) | $k=0.0$ parity, exact entropy fixtures, bounded temperature and Min-P control, error precedence | `Config::reference_v2` | Training-time entropy adjustments |
 | **GX13** | `acceptance` | `PASS` | Activation hooks, inspectability & bounded steering (`Addendum A1 §A2`) | Bitwise match on disabled/record/zero/patch; export caps; cache intervention policy hash | `Config::reference_v2` | Training-time steering |
 | **GX14** | `acceptance` | `PASS` | Paired perturbation & semantic flip-rate evaluation (`Addendum A1 §A3`) | Deterministic generators, 0% split prompt leakage, hand-worked metrics parity, bootstrap reproducibility, trivial baselines | `Config::reference_v2` | Model training dependencies |
+| **GX15** | `acceptance` | `PASS` | FP32 Low-Rank Adaptation (LoRA) (`Addendum A1 §A5`) | Zero-init bitwise match, analytic gradcheck vs finite differences, base weight immutability, merge equivalence $W' = W + sBA$, header integrity & adapter compatibility | `Config::reference_v2` | Quantized LoRA, base weight training |
 
 ---
 
