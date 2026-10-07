@@ -560,7 +560,7 @@ pub fn g12() -> GateReport {
     let t0 = Instant::now();
     let m = Model::init(&Config::reference_v2()).unwrap();
     let prompt = [256u32, 82, 117];
-    let s = SamplingParams { temperature: 0.8, top_k: 20, top_p: 0.9, max_new_tokens: 4, seed: 5 };
+    let s = SamplingParams { temperature: 0.8, top_k: 20, top_p: 0.9, max_new_tokens: 4, seed: 5, ..Default::default() };
     let seeded = generate(&m, &prompt, &s).unwrap().tokens == generate(&m, &prompt, &s).unwrap().tokens;
     let g = SamplingParams { max_new_tokens: 4, ..Default::default() };
     let greedy_no_prng = generate(&m, &prompt, &g).unwrap().tokens == generate(&m, &prompt, &SamplingParams { seed: 999, ..g.clone() }).unwrap().tokens;
@@ -701,6 +701,7 @@ pub fn run(ids: &[&str]) -> Result<Vec<GateReport>, String> {
             "g12" => g12(),
             "g13" => g13(),
             "g14" => g14(),
+            "gx12e" => crate::generation::gx12e(),
             "gx13" => crate::hooks::gx13(),
             "gx14" => crate::eval::gx14(),
             other => return Err(format!("unknown gate id: '{other}'")),

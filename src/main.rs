@@ -154,6 +154,7 @@ fn main() -> ExitCode {
                 top_p,
                 max_new_tokens,
                 seed,
+                adaptive: None,
             };
             match generate(&model, &prompt, &params) {
                 Ok(out) => {

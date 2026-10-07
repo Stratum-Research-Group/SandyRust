@@ -103,6 +103,7 @@ cargo run --release -- eval flip --task kv_lookup --split test
 | **G12** | `acceptance` | **Sampling Determinism** | Seeded sampling reproduces tokens; terminal logit parity; UTF-8 stream buffer | **PASS** |
 | **G13** | `acceptance` | **GPU Spike** | Optional GPU spike deferred under CPU baseline | **NOT RUN** (D2-R1) |
 | **G14** | `regression` | **Failure Mode Handling** | Oversized checkpoints, capacity overflows, and rank errors rejected safely | **PASS** |
+| **GX12E** | `acceptance` | **Entropy-Feedback Sampling** | Bounded temperature & Min-P adaptive sampling; exact fixtures; $k=0$ parity | **PASS** |
 | **GX13** | `acceptance` | **Activation Hooks & Steering** | Zero-overhead Off mode; bitwise record/patch parity; bounded steering | **PASS** |
 | **GX14** | `acceptance` | **Paired Perturbation & Flip-Rate** | 4 synthetic task generators; 0% split leakage; exact hand-worked metrics; reproducible bootstrap | **PASS** |
 
