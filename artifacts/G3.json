@@ -3,16 +3,16 @@
   "gate_id": "G3",
   "status": "PASS",
   "reason": null,
-  "revision": "unversioned",
-  "fixture_hash": "n/a-analytic",
+  "revision": "1a5fde2",
+  "fixture_hash": "g3-repeated-tokens-f64",
   "config": "reference_v2",
   "command": "cargo run -- verify",
   "backend": "cpu_reference",
   "device": "cpu",
-  "dtype": "fp32",
+  "dtype": "fp64",
   "expected": "finite-difference matches analytic with 0 failures",
-  "observed": "Ok(GradCheckReport { checked: 114, failures: 0, max_abs_err: 8.861826450608234e-9, max_rel_err: 0.000335283947141383 })",
-  "tolerance_atol": 0.000001,
-  "tolerance_rtol": 0.0001,
-  "execution_time_ms": 1310
+  "observed": "Ok(GradCheckReport { checked: 114, failures: 0, max_abs_err: 6.284789657445833e-9, max_rel_err: 0.0001926368949907955 })",
+  "tolerance_atol": 0.00001,
+  "tolerance_rtol": 0.001,
+  "execution_time_ms": 1549
 }

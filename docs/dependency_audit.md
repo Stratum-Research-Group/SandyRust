@@ -18,7 +18,7 @@
 * **C / C++ / CUDA Sources:** Strictly zero in codebase and build tree.
 * **Disclosed System Runtime Linkage:**
   - Standard Rust `std` OS runtime interfaces.
-  - Linux host dynamically loaded platform libraries: `libc.so.6`, `libm.so.6`, `libpthread.so.0`, `libdl.so.2`, `librt.so.1`, `ld-linux-x86-64.so.2`.
+  - Linux host dynamically loaded platform libraries (verified via `ldd target/release/sandy_rust`): `linux-vdso.so.1`, `libgcc_s.so.1`, `libm.so.6`, `libc.so.6`, `/lib64/ld-linux-x86-64.so.2`.
 
 ## 3. Compliance Verdict
 

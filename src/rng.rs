@@ -39,6 +39,14 @@ impl Rng {
         Rng { state, buf: [0; 16], idx: 16 }
     }
 
+    pub fn dump_state(&self) -> ([u32; 16], [u32; 16], usize) {
+        (self.state, self.buf, self.idx)
+    }
+
+    pub fn from_state(state: [u32; 16], buf: [u32; 16], idx: usize) -> Self {
+        Rng { state, buf, idx }
+    }
+
     fn refill(&mut self) {
         let mut w = self.state;
         for _ in 0..10 {

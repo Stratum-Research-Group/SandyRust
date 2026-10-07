@@ -1,6 +1,6 @@
 # Decision Record (specv3.md §1)
 
-Recorded 2026-10-07 by Nick (project owner), approving the recommended baseline.
+Recorded 2026-10-07 as repository-declared choices for the recommended baseline (specv3 §1).
 
 | ID | Decision | Choice |
 | :-- | :-- | :-- |

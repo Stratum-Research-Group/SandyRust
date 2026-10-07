@@ -9,6 +9,7 @@ pub const VOCAB: usize = 259;
 pub enum TokenizerError {
     /// A token id outside the vocabulary was supplied to `decode`.
     InvalidId(u32),
+    UnsupportedConfig,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -17,6 +18,13 @@ pub struct ByteTokenizer;
 impl ByteTokenizer {
     pub fn new() -> Self {
         ByteTokenizer
+    }
+
+    pub fn validate_config(cfg: &crate::config::Config) -> Result<(), TokenizerError> {
+        if cfg.vocab_size != 259 || cfg.bos_id != 256 || cfg.eos_id != 257 || cfg.pad_id != 258 {
+            return Err(TokenizerError::UnsupportedConfig);
+        }
+        Ok(())
     }
 
     /// Raw encoding never emits special tokens.
@@ -56,6 +64,84 @@ impl ByteTokenizer {
     }
 }
 
+/// Incremental UTF-8 byte stream buffer (§5.1, Item 17).
+#[derive(Debug, Clone, Default)]
+pub struct Utf8ByteStreamBuffer {
+    pending: Vec<u8>,
+}
+
+impl Utf8ByteStreamBuffer {
+    pub fn new() -> Self {
+        Self { pending: Vec::new() }
+    }
+
+    pub fn push_byte(&mut self, b: u8) -> String {
+        self.push_bytes(&[b])
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        let mut consumed = 0;
+
+        while consumed < self.pending.len() {
+            let slice = &self.pending[consumed..];
+            match std::str::from_utf8(slice) {
+                Ok(s) => {
+                    out.push_str(s);
+                    consumed = self.pending.len();
+                    break;
+                }
+                Err(e) => {
+                    let valid_len = e.valid_up_to();
+                    if valid_len > 0 {
+                        let valid_str = std::str::from_utf8(&slice[..valid_len]).unwrap();
+                        out.push_str(valid_str);
+                        consumed += valid_len;
+                    }
+                    if let Some(error_len) = e.error_len() {
+                        out.push('\u{FFFD}');
+                        consumed += error_len;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        self.pending.drain(..consumed);
+        out
+    }
+
+    pub fn flush(&mut self) -> String {
+        let mut out = String::new();
+        while !self.pending.is_empty() {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid_len = e.valid_up_to();
+                    if valid_len > 0 {
+                        out.push_str(std::str::from_utf8(&self.pending[..valid_len]).unwrap());
+                        self.pending.drain(..valid_len);
+                        continue;
+                    }
+                    out.push('\u{FFFD}');
+                    let step = e.error_len().unwrap_or(1);
+                    self.pending.drain(..step);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +169,20 @@ mod tests {
     fn invalid_utf8_renders_replacement() {
         let t = ByteTokenizer::new();
         assert_eq!(t.decode(&[0xFF]).unwrap(), "\u{FFFD}");
+    }
+
+    #[test]
+    fn utf8_byte_stream_buffer_incremental() {
+        let mut buf = Utf8ByteStreamBuffer::new();
+        let crab = "🦀".as_bytes(); // 4 bytes: [240, 159, 166, 128]
+        assert_eq!(buf.push_byte(crab[0]), "");
+        assert_eq!(buf.push_byte(crab[1]), "");
+        assert_eq!(buf.push_byte(crab[2]), "");
+        assert_eq!(buf.push_byte(crab[3]), "🦀");
+        assert!(buf.is_empty());
+
+        // Incomplete flush produces replacement char
+        assert_eq!(buf.push_byte(crab[0]), "");
+        assert_eq!(buf.flush(), "\u{FFFD}");
     }
 }

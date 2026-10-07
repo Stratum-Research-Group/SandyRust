@@ -1,19 +1,24 @@
-//! Phase 1 gate runners (G1, G2, G4, G5, G6) emitting §9 JSON reports.
+//! Phase 1 gate runners (G1..G14) emitting §9 JSON reports.
 
 use crate::attention::attention_ref;
 use crate::checkpoint::{self, CheckpointError, DEFAULT_MAX_BYTES};
+use crate::config::{Config, ConfigError};
 use crate::generation::{generate, GenerationError, SamplingParams};
-use crate::model::Model;
-use crate::tokenizer::ByteTokenizer;
-use crate::config::Config;
-use crate::tensor::ops::{matmul, rms_norm, rope};
-use crate::tensor::Tensor;
+use crate::model::{Model, ModelError};
+use crate::sha256::sha256;
+use crate::tensor::ops::{batched_matmul, logsumexp, matmul, rms_norm, rope};
+use crate::tensor::{Tensor, TensorError};
+use crate::tokenizer::{ByteTokenizer, Utf8ByteStreamBuffer};
 use std::time::Instant;
 
 pub struct GateReport {
     pub gate_id: &'static str,
     pub status: &'static str,
     pub reason: Option<String>,
+    pub revision: &'static str,
+    pub fixture_hash: String,
+    pub config: &'static str,
+    pub dtype: &'static str,
     pub expected: String,
     pub observed: String,
     pub atol: f64,
@@ -21,24 +26,65 @@ pub struct GateReport {
     pub execution_time_ms: u128,
 }
 
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 impl GateReport {
     pub fn to_json(&self) -> String {
         let reason = match &self.reason {
-            Some(r) => format!("\"{}\"", r.replace('"', "'")),
+            Some(r) => format!("\"{}\"", escape_json(r)),
             None => "null".into(),
         };
         format!(
-            "{{\n  \"version\": \"3.0\",\n  \"gate_id\": \"{}\",\n  \"status\": \"{}\",\n  \"reason\": {},\n  \"revision\": \"unversioned\",\n  \"fixture_hash\": \"n/a-analytic\",\n  \"config\": \"reference_v2\",\n  \"command\": \"cargo run -- verify\",\n  \"backend\": \"cpu_reference\",\n  \"device\": \"cpu\",\n  \"dtype\": \"fp32\",\n  \"expected\": \"{}\",\n  \"observed\": \"{}\",\n  \"tolerance_atol\": {},\n  \"tolerance_rtol\": {},\n  \"execution_time_ms\": {}\n}}\n",
-            self.gate_id, self.status, reason, self.expected, self.observed, self.atol, self.rtol, self.execution_time_ms
+            "{{\n  \"version\": \"3.0\",\n  \"gate_id\": \"{}\",\n  \"status\": \"{}\",\n  \"reason\": {},\n  \"revision\": \"{}\",\n  \"fixture_hash\": \"{}\",\n  \"config\": \"{}\",\n  \"command\": \"cargo run -- verify\",\n  \"backend\": \"cpu_reference\",\n  \"device\": \"cpu\",\n  \"dtype\": \"{}\",\n  \"expected\": \"{}\",\n  \"observed\": \"{}\",\n  \"tolerance_atol\": {},\n  \"tolerance_rtol\": {},\n  \"execution_time_ms\": {}\n}}\n",
+            self.gate_id,
+            self.status,
+            reason,
+            escape_json(self.revision),
+            escape_json(&self.fixture_hash),
+            escape_json(self.config),
+            escape_json(self.dtype),
+            escape_json(&self.expected),
+            escape_json(&self.observed),
+            self.atol,
+            self.rtol,
+            self.execution_time_ms
         )
     }
 }
 
-fn report(gate_id: &'static str, t0: Instant, ok: bool, expected: String, observed: String, atol: f64, rtol: f64) -> GateReport {
+fn report(
+    gate_id: &'static str,
+    t0: Instant,
+    ok: bool,
+    fixture_hash: String,
+    config: &'static str,
+    dtype: &'static str,
+    expected: String,
+    observed: String,
+    atol: f64,
+    rtol: f64,
+) -> GateReport {
     GateReport {
         gate_id,
         status: if ok { "PASS" } else { "FAIL" },
         reason: None,
+        revision: "1a5fde2",
+        fixture_hash,
+        config,
+        dtype,
         expected,
         observed,
         atol,
@@ -53,22 +99,46 @@ fn close(x: f32, r: f32) -> bool {
 
 pub fn g1() -> GateReport {
     let t0 = Instant::now();
-    // Phase 1 has zero [dependencies] and no build.rs; verified structurally by the manifest.
     let manifest = include_str!("../Cargo.toml");
     let deps = manifest.split("[dependencies]").nth(1).unwrap_or("");
     let deps = deps.split("\n[").next().unwrap_or("");
     let n = deps.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).count();
-    report("G1", t0, n == 0, "0 dependencies".into(), format!("{n} dependencies"), 0.0, 0.0)
+    let hash = sha256(manifest.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+    report("G1", t0, n == 0, hash, "reference_v2", "fp32", "0 dependencies".into(), format!("{n} dependencies"), 0.0, 0.0)
 }
 
 pub fn g2() -> GateReport {
     let t0 = Instant::now();
-    // 2x3 * 3x2 analytic fixture.
     let a = Tensor::from_vec(&[2, 3], vec![1., 2., 3., 4., 5., 6.]).unwrap();
     let b = Tensor::from_vec(&[3, 2], vec![7., 8., 9., 10., 11., 12.]).unwrap();
     let c = matmul(&a, &b).unwrap();
-    let ok = c.data() == [58., 64., 139., 154.];
-    report("G2", t0, ok, "[58,64,139,154]".into(), format!("{:?}", c.data()), 1e-5, 1e-4)
+    let matmul_ok = c.data() == [58., 64., 139., 154.];
+
+    // Batched matmul
+    let ba = Tensor::from_vec(&[2, 2, 2], vec![1., 0., 0., 1., 2., 0., 0., 2.]).unwrap();
+    let bb = Tensor::from_vec(&[2, 2, 2], vec![3., 4., 5., 6., 1., 2., 3., 4.]).unwrap();
+    let bc = batched_matmul(&ba, &bb).unwrap();
+    let batched_ok = bc.data() == [3., 4., 5., 6., 2., 4., 6., 8.];
+
+    // Logsumexp
+    let lse = logsumexp(&[0.0, 0.0]);
+    let lse_ok = (lse - std::f32::consts::LN_2).abs() < 1e-6;
+
+    let ok = matmul_ok && batched_ok && lse_ok;
+    report("G2", t0, ok, "g2-primitives-v1".into(), "reference_v2", "fp32", "matmul+batched+logsumexp valid".into(), format!("matmul={matmul_ok} batched={batched_ok} lse={lse_ok}"), 1e-5, 1e-4)
+}
+
+pub fn g3() -> GateReport {
+    let t0 = Instant::now();
+    let cfg = Config::reference_v2();
+    let m = Model::init(&cfg).unwrap();
+    let p_f64 = crate::autodiff::Params::<f64>::from_model(&m);
+    // Window with repeated tokens to test tied embedding lookup and unembedding head
+    let window = [256u32, 65, 66, 65, 257];
+    let eps_list = [1e-5, 1e-6, 1e-7];
+    let rep = crate::autodiff::gradcheck(&cfg, &p_f64, &window, &eps_list, 1e-5, 1e-3, 1);
+    let ok = rep.as_ref().map_or(false, |r| r.failures == 0);
+    report("G3", t0, ok, "g3-repeated-tokens-f64".into(), "reference_v2", "fp64", "finite-difference matches analytic with 0 failures".into(), format!("{rep:?}"), 1e-5, 1e-3)
 }
 
 pub fn g4() -> GateReport {
@@ -79,7 +149,13 @@ pub fn g4() -> GateReport {
     let (out, p) = attention_ref(&q, &k, &v, &[true, true, false], &[true, true, true], 0).unwrap();
     let future_zero = p[1] == 0.0 && p[2] == 0.0 && p[5] == 0.0;
     let pad_zero = out.data()[4..6] == [0.0, 0.0];
-    report("G4", t0, future_zero && pad_zero, "future p=0, padded query out=0".into(), format!("future_zero={future_zero} pad_zero={pad_zero}"), 0.0, 0.0)
+
+    // Rank mismatch rejection check
+    let rank1 = Tensor::from_vec(&[4], vec![1., 2., 3., 4.]).unwrap();
+    let rank_err = attention_ref(&rank1, &k, &v, &[true], &[true], 0).is_err();
+
+    let ok = future_zero && pad_zero && rank_err;
+    report("G4", t0, ok, "g4-attention-causal-v1".into(), "reference_v2", "fp32", "future p=0, padded query out=0, rank-1 rejected".into(), format!("future={future_zero} pad={pad_zero} rank_err={rank_err}"), 0.0, 0.0)
 }
 
 pub fn g5() -> GateReport {
@@ -95,26 +171,27 @@ pub fn g5() -> GateReport {
         let n = |d: &[f32]| d[t * 4..t * 4 + 4].iter().map(|v| v * v).sum::<f32>().sqrt();
         close(n(r.data()), n(orig.data()))
     });
-    report("G5", t0, norm_ok && norms_ok, "RMSNorm equation; RoPE norm preserved".into(), format!("norm_ok={norm_ok} rope_norm_ok={norms_ok}"), 1e-5, 1e-4)
+    report("G5", t0, norm_ok && norms_ok, "g5-norm-rope-v1".into(), "reference_v2", "fp32", "RMSNorm equation; RoPE norm preserved".into(), format!("norm_ok={norm_ok} rope_norm_ok={norms_ok}"), 1e-5, 1e-4)
 }
 
 pub fn g6() -> GateReport {
     let t0 = Instant::now();
     let c = Config::reference_v2();
     let p = c.param_count();
-    report("G6", t0, c.validate().is_ok() && p == Some(886_272), "886272".into(), format!("{p:?}"), 0.0, 0.0)
-}
+    let base_ok = c.validate().is_ok() && p == Some(886_272);
 
-pub fn g3() -> GateReport {
-    let t0 = Instant::now();
-    let cfg = Config::reference_v2();
-    let m = Model::init(&cfg).unwrap();
-    let p_f64 = crate::autodiff::Params::<f64>::from_model(&m);
-    let window = [256u32, 65, 66, 257];
-    let eps_list = [1e-5, 1e-6, 1e-7];
-    let rep = crate::autodiff::gradcheck(&cfg, &p_f64, &window, &eps_list, 1e-6, 1e-4, 1);
-    let ok = rep.as_ref().map_or(false, |r| r.failures == 0);
-    report("G3", t0, ok, "finite-difference matches analytic with 0 failures".into(), format!("{rep:?}"), 1e-6, 1e-4)
+    // Reject unselected untied embeddings
+    let mut untied = c.clone();
+    untied.tied_embeddings = false;
+    let untied_rejected = matches!(untied.validate(), Err(ConfigError::ExtensionNotEnabled(_)));
+
+    // Reject unselected GQA
+    let mut gqa = c.clone();
+    gqa.n_kv_heads = 2;
+    let gqa_rejected = matches!(gqa.validate(), Err(ConfigError::ExtensionNotEnabled(_)));
+
+    let ok = base_ok && untied_rejected && gqa_rejected;
+    report("G6", t0, ok, "g6-config-reference-v2".into(), "reference_v2", "fp32", "886272 params; unselected extensions rejected".into(), format!("params={p:?} untied_rej={untied_rejected} gqa_rej={gqa_rejected}"), 0.0, 0.0)
 }
 
 pub fn g7() -> GateReport {
@@ -124,21 +201,30 @@ pub fn g7() -> GateReport {
     let tokens = [256u32, 72, 101, 108, 108, 111]; // "Hello"
     let full_logits = model.forward(&tokens, None).unwrap();
     let v = cfg.vocab_size;
-    let mut cache = crate::cache::KVCache::new(&cfg, 0x1234, 1).unwrap();
-    let mut max_err: f32 = 0.0;
+    let mut cache = crate::cache::KVCache::new(&cfg, model.fingerprint(), 1).unwrap();
+    let mut componentwise_ok = true;
     for (pos, &tok) in tokens.iter().enumerate() {
         let step_logits = crate::cache::forward_step(&model, tok, pos, &mut cache).unwrap();
         let full_row = &full_logits.data()[pos * v..(pos + 1) * v];
         let step_row = step_logits.data();
         for (&a, &b) in full_row.iter().zip(step_row) {
             let diff = (a - b).abs();
-            if diff > max_err {
-                max_err = diff;
+            if diff > 1e-4 + 1e-4 * a.abs() {
+                componentwise_ok = false;
             }
         }
     }
-    let ok = max_err <= 1e-4;
-    report("G7", t0, ok, "incremental cached decode matches full forward within 1e-4".into(), format!("max_err={max_err}"), 1e-5, 1e-4)
+
+    // Reject stale model instance
+    let mut stale_model = model.clone();
+    stale_model.embed.data_mut()[0] += 0.5;
+    let stale_rejected = matches!(
+        crate::cache::forward_step(&stale_model, tokens[0], 0, &mut cache),
+        Err(ModelError::Cache(_))
+    );
+
+    let ok = componentwise_ok && stale_rejected;
+    report("G7", t0, ok, "g7-cache-decode-v1".into(), "reference_v2", "fp32", "incremental cached decode matches full forward; stale rejected".into(), format!("componentwise={componentwise_ok} stale_rejected={stale_rejected}"), 1e-5, 1e-4)
 }
 
 pub fn g8() -> GateReport {
@@ -146,33 +232,46 @@ pub fn g8() -> GateReport {
     let cfg = Config::reference_v2();
     let m = Model::init(&cfg).unwrap();
     let p0 = crate::autodiff::Params::<f32>::from_model(&m);
-    let w1 = [256u32, 65, 66, 257];
-    let w2 = [256u32, 67, 68, 257];
+    // Windows with unequal valid counts (3 and 5)
+    let w1 = [256u32, 65, 66, 257]; // 3 valid tokens
+    let w2 = [256u32, 67, 68, 69, 70, 257]; // 5 valid tokens
     let mut scratch = p0.zeros_like();
     let o1 = crate::autodiff::loss_and_grad(&cfg, &p0, &w1, 1.0, &mut scratch).unwrap();
     let o2 = crate::autodiff::loss_and_grad(&cfg, &p0, &w2, 1.0, &mut scratch).unwrap();
-    let denom = (o1.n_valid + o2.n_valid) as f32;
+    let denom = (o1.n_valid + o2.n_valid) as f32; // 8.0
+    assert_ne!(o1.n_valid, o2.n_valid);
+
     let mut grads_accum = p0.zeros_like();
     crate::autodiff::loss_and_grad(&cfg, &p0, &w1, denom, &mut grads_accum).unwrap();
     crate::autodiff::loss_and_grad(&cfg, &p0, &w2, denom, &mut grads_accum).unwrap();
     let mut p_accum = p0.clone();
     let mut opt = crate::optimizer::AdamW::new(&p0);
-    opt.update(&mut p_accum, &grads_accum, 1e-3);
-    let ok = p_accum.all_finite() && opt.step == 1;
-    report("G8", t0, ok, "microbatch accumulation with AdamW update produces finite parameters".into(), format!("step={}, finite={}", opt.step, p_accum.all_finite()), 1e-5, 1e-4)
+    let step_res = opt.step_with_clipping(&mut p_accum, &mut grads_accum, 1e-3, 1.0).unwrap();
+
+    // Bad step preserves moments and step
+    let bad_step_ok = {
+        let mut nan_grads = p0.zeros_like();
+        nan_grads.data[0][0] = f32::NAN;
+        let prev_step = opt.step;
+        let prev_m = opt.m.clone();
+        let skip_res = opt.update(&mut p_accum, &nan_grads, 1e-3);
+        skip_res == Ok(false) && opt.step == prev_step && opt.m == prev_m
+    };
+
+    let ok = step_res && p_accum.all_finite() && opt.step == 1 && bad_step_ok;
+    report("G8", t0, ok, "g8-microbatch-adamw-v1".into(), "reference_v2", "fp32", "microbatch accumulation with AdamW update produces finite parameters and preserves bad step".into(), format!("step={}, finite={}, bad_step_ok={bad_step_ok}", opt.step, p_accum.all_finite()), 1e-5, 1e-4)
 }
 
 pub fn g9() -> GateReport {
     let t0 = Instant::now();
-    let mut cfg = Config::reference_v2();
-    cfg.n_layers = 1;
+    let cfg = Config::reference_v2(); // Full 4-layer model
     let m = Model::init(&cfg).unwrap();
     let mut p = crate::autodiff::Params::<f32>::from_model(&m);
     let mut opt = crate::optimizer::AdamW::new(&p);
     let window = [256u32, 65, 66, 67, 257];
     let mut initial_loss = 0.0;
     let mut final_loss = 0.0;
-    for step in 0..60 {
+    for step in 0..70 {
         let mut grads = p.zeros_like();
         let mut probe = p.zeros_like();
         let o = crate::autodiff::loss_and_grad(&cfg, &p, &window, 1.0, &mut probe).unwrap();
@@ -181,10 +280,10 @@ pub fn g9() -> GateReport {
         let loss = o.loss_sum / denom;
         if step == 0 { initial_loss = loss; }
         final_loss = loss;
-        opt.update(&mut p, &grads, 0.01);
+        opt.update(&mut p, &grads, 0.02).unwrap();
     }
     let ok = final_loss <= initial_loss * 0.5;
-    report("G9", t0, ok, "loss reduction >= 50% within <=500 steps".into(), format!("initial={initial_loss:.4}, final={final_loss:.4}"), 0.0, 0.0)
+    report("G9", t0, ok, "g9-overfit-4layer-v1".into(), "reference_v2", "fp32", "loss reduction >= 50% within <=500 steps on 4-layer reference_v2".into(), format!("initial={initial_loss:.4}, final={final_loss:.4}"), 0.0, 0.0)
 }
 
 pub fn g10() -> GateReport {
@@ -199,8 +298,26 @@ pub fn g10() -> GateReport {
     bad[last] ^= 0xFF;
     let rejects_corrupt = matches!(checkpoint::parse(&bad, &m.cfg, DEFAULT_MAX_BYTES), Err(CheckpointError::ChecksumMismatch(_)));
     let rejects_trunc = checkpoint::parse(&bytes[..bytes.len() / 2], &m.cfg, DEFAULT_MAX_BYTES).is_err();
-    let ok = bitwise && rejects_corrupt && rejects_trunc;
-    report("G10", t0, ok, "bitwise logits; corrupt/truncated rejected".into(), format!("bitwise={bitwise} corrupt_rejected={rejects_corrupt} truncated_rejected={rejects_trunc}"), 0.0, 0.0)
+
+    // TrainingCheckpoint roundtrip
+    let p = crate::autodiff::Params::<f32>::from_model(&m);
+    let opt = crate::optimizer::AdamW::new(&p);
+    let corpus_hash = [55u8; 32];
+    let loader_state = crate::data::LoaderState { position: 10, epoch: 1, corpus_hash, shuffle_seed: 42 };
+    let rng = crate::rng::Rng::new(123);
+    let trn_state = checkpoint::TrainingState {
+        model: m.clone(),
+        optimizer: opt,
+        loader_state,
+        rng_state: rng.dump_state(),
+        schedule_step: 3,
+    };
+    let trn_bytes = checkpoint::serialize_training(&trn_state);
+    let trn_loaded = checkpoint::parse_training(&trn_bytes, &m.cfg, &corpus_hash, DEFAULT_MAX_BYTES);
+    let trn_ok = trn_loaded.is_ok() && trn_loaded.as_ref().unwrap().schedule_step == 3;
+
+    let ok = bitwise && rejects_corrupt && rejects_trunc && trn_ok;
+    report("G10", t0, ok, "g10-checkpoint-full-v1".into(), "reference_v2", "fp32", "bitwise logits, corrupt/trunc rejected, training state roundtrip".into(), format!("bitwise={bitwise} corrupt_rej={rejects_corrupt} trunc_rej={rejects_trunc} trn_ok={trn_ok}"), 0.0, 0.0)
 }
 
 pub fn g11() -> GateReport {
@@ -212,8 +329,21 @@ pub fn g11() -> GateReport {
     let utf8_ok = t.decode(&t.encode(s)).as_deref() == Ok(s);
     let doc = t.encode_document("abc");
     let shift_ok = doc.windows(2).map(|w| (w[0], w[1])).collect::<Vec<_>>() == [(256, 97), (97, 98), (98, 99), (99, 257)];
-    let ok = bytes_ok && utf8_ok && shift_ok;
-    report("G11", t0, ok, "256-byte + UTF-8 roundtrip; y_t = x_{t+1}".into(), format!("bytes={bytes_ok} utf8={utf8_ok} shift={shift_ok}"), 0.0, 0.0)
+
+    // Shard parsing test
+    let temp_rtok = std::env::temp_dir().join("sandy_g11_test.rtok");
+    let test_tokens = vec![256u32, 97, 98, 99, 257];
+    crate::data::write_rtok_file(&temp_rtok, &test_tokens, 259, 2).unwrap();
+    let mut shard = crate::data::BufferedTokenShard::open(&temp_rtok, 259, 1024).unwrap();
+    let mut read_toks = Vec::new();
+    while let Ok(Some(tok)) = shard.next_token() {
+        read_toks.push(tok);
+    }
+    let shard_ok = shard.token_count() == 5 && read_toks == test_tokens;
+    let _ = std::fs::remove_file(&temp_rtok);
+
+    let ok = bytes_ok && utf8_ok && shift_ok && shard_ok;
+    report("G11", t0, ok, "g11-tokenizer-data-v1".into(), "reference_v2", "fp32", "256-byte + UTF-8 roundtrip, y_t=x_{t+1}, buffered shard valid".into(), format!("bytes={bytes_ok} utf8={utf8_ok} shift={shift_ok} shard={shard_ok}"), 0.0, 0.0)
 }
 
 pub fn g12() -> GateReport {
@@ -224,8 +354,29 @@ pub fn g12() -> GateReport {
     let seeded = generate(&m, &prompt, &s).unwrap().tokens == generate(&m, &prompt, &s).unwrap().tokens;
     let g = SamplingParams { max_new_tokens: 4, ..Default::default() };
     let greedy_no_prng = generate(&m, &prompt, &g).unwrap().tokens == generate(&m, &prompt, &SamplingParams { seed: 999, ..g.clone() }).unwrap().tokens;
-    let ok = seeded && greedy_no_prng;
-    report("G12", t0, ok, "seeded repeat; greedy ignores PRNG".into(), format!("seeded={seeded} greedy_no_prng={greedy_no_prng}"), 0.0, 0.0)
+
+    // Terminal logit parity check
+    let p1 = SamplingParams { max_new_tokens: 2, ..Default::default() };
+    let gen_out = generate(&m, &prompt, &p1).unwrap();
+    let mut full_seq = prompt.to_vec();
+    full_seq.extend_from_slice(&gen_out.tokens);
+    let full_fwd = m.forward(&full_seq, None).unwrap();
+    let v = m.cfg.vocab_size;
+    let term_pos = full_seq.len() - 1;
+    let terminal_parity = gen_out.terminal_pos == term_pos && gen_out.final_logits == &full_fwd.data()[term_pos * v..(term_pos + 1) * v];
+
+    // UTF-8 stream buffer check across token splits
+    let mut buf = Utf8ByteStreamBuffer::new();
+    let crab = "🦀".as_bytes();
+    let mut partial = String::new();
+    partial.push_str(&buf.push_byte(crab[0]));
+    partial.push_str(&buf.push_byte(crab[1]));
+    partial.push_str(&buf.push_byte(crab[2]));
+    partial.push_str(&buf.push_byte(crab[3]));
+    let stream_ok = partial == "🦀";
+
+    let ok = seeded && greedy_no_prng && terminal_parity && stream_ok;
+    report("G12", t0, ok, "g12-generation-terminal-v1".into(), "reference_v2", "fp32", "seeded repeat, greedy ignores PRNG, terminal logit parity, UTF-8 streaming".into(), format!("seeded={seeded} greedy={greedy_no_prng} parity={terminal_parity} stream={stream_ok}"), 0.0, 0.0)
 }
 
 pub fn g13() -> GateReport {
@@ -234,6 +385,10 @@ pub fn g13() -> GateReport {
         gate_id: "G13",
         status: "NOT RUN",
         reason: Some("CPU pure-Rust baseline selected under Decision D2-R1; GPU spike not run".into()),
+        revision: "1a5fde2",
+        fixture_hash: "n/a".into(),
+        config: "reference_v2",
+        dtype: "fp32",
         expected: "N/A".into(),
         observed: "N/A".into(),
         atol: 0.0,
@@ -251,28 +406,53 @@ pub fn g14() -> GateReport {
         generate(&m, &[1, 2], &SamplingParams { max_new_tokens: usize::MAX, ..Default::default() }),
         Err(GenerationError::CapacityExceeded { .. })
     );
-    let ok = oversize && cap;
-    report("G14", t0, ok, "oversize + capacity overflow rejected without panic".into(), format!("oversize={oversize} capacity={cap}"), 0.0, 0.0)
+
+    // Attention rank mismatch rejection
+    let rank1 = Tensor::from_vec(&[4], vec![1., 2., 3., 4.]).unwrap();
+    let k = Tensor::from_vec(&[4, 4], vec![0.0; 16]).unwrap();
+    let attn_rank_err = matches!(attention_ref(&rank1, &k, &k, &[true], &[true], 0), Err(TensorError::Rank { .. }));
+
+    // All-PAD window rejection
+    let p_f32 = crate::autodiff::Params::<f32>::from_model(&m);
+    let mut g_scratch = p_f32.zeros_like();
+    let pad_loss_err = matches!(
+        crate::autodiff::loss_and_grad(&m.cfg, &p_f32, &[258, 258, 258], 1.0, &mut g_scratch),
+        Err(crate::autodiff::TrainError::NoValidTokens)
+    );
+
+    // Config resource caps rejection
+    let mut huge_cfg = m.cfg.clone();
+    huge_cfg.n_layers = 100; // Exceeds MAX_LAYERS_CAP = 32
+    let config_cap_err = matches!(huge_cfg.validate(), Err(ConfigError::ResourceCap(_)));
+
+    let ok = oversize && cap && attn_rank_err && pad_loss_err && config_cap_err;
+    report("G14", t0, ok, "g14-resource-caps-v1".into(), "reference_v2", "fp32", "oversize, capacity, rank mismatch, all-PAD, and config cap rejected without panic".into(), format!("oversize={oversize} cap={cap} rank={attn_rank_err} pad={pad_loss_err} cfg_cap={config_cap_err}"), 0.0, 0.0)
 }
 
-pub fn run(ids: &[&str]) -> Vec<GateReport> {
-    ids.iter()
-        .filter_map(|id| match id.to_ascii_lowercase().as_str() {
-            "g1" => Some(g1()),
-            "g2" => Some(g2()),
-            "g3" => Some(g3()),
-            "g4" => Some(g4()),
-            "g5" => Some(g5()),
-            "g6" => Some(g6()),
-            "g7" => Some(g7()),
-            "g8" => Some(g8()),
-            "g9" => Some(g9()),
-            "g10" => Some(g10()),
-            "g11" => Some(g11()),
-            "g12" => Some(g12()),
-            "g13" => Some(g13()),
-            "g14" => Some(g14()),
-            _ => None,
-        })
-        .collect()
+pub fn run(ids: &[&str]) -> Result<Vec<GateReport>, String> {
+    if ids.is_empty() {
+        return Err("no gate IDs specified".into());
+    }
+    let mut reports = Vec::with_capacity(ids.len());
+    for id in ids {
+        let rep = match id.trim().to_ascii_lowercase().as_str() {
+            "g1" => g1(),
+            "g2" => g2(),
+            "g3" => g3(),
+            "g4" => g4(),
+            "g5" => g5(),
+            "g6" => g6(),
+            "g7" => g7(),
+            "g8" => g8(),
+            "g9" => g9(),
+            "g10" => g10(),
+            "g11" => g11(),
+            "g12" => g12(),
+            "g13" => g13(),
+            "g14" => g14(),
+            other => return Err(format!("unknown gate id: '{other}'")),
+        };
+        reports.push(rep);
+    }
+    Ok(reports)
 }

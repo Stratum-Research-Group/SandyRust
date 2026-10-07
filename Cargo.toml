@@ -2,6 +2,7 @@
 name = "sandy_rust"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82.0"
 description = "Standalone pure-Rust decoder-only transformer (specv3.md reference_v2 baseline)"
 license = "MIT OR Apache-2.0"
 

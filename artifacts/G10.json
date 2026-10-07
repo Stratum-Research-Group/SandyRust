@@ -3,16 +3,16 @@
   "gate_id": "G10",
   "status": "PASS",
   "reason": null,
-  "revision": "unversioned",
-  "fixture_hash": "n/a-analytic",
+  "revision": "1a5fde2",
+  "fixture_hash": "g10-checkpoint-full-v1",
   "config": "reference_v2",
   "command": "cargo run -- verify",
   "backend": "cpu_reference",
   "device": "cpu",
   "dtype": "fp32",
-  "expected": "bitwise logits; corrupt/truncated rejected",
-  "observed": "bitwise=true corrupt_rejected=true truncated_rejected=true",
+  "expected": "bitwise logits, corrupt/trunc rejected, training state roundtrip",
+  "observed": "bitwise=true corrupt_rej=true trunc_rej=true trn_ok=true",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 61
+  "execution_time_ms": 145
 }

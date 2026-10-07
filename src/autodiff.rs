@@ -224,6 +224,7 @@ struct LayerCache<T> {
     hid: Vec<T>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct LossOut<T> {
     pub loss_sum: T,
     pub n_valid: usize,
@@ -241,6 +242,18 @@ pub fn loss_and_grad<T: Float>(
 ) -> Result<LossOut<T>, TrainError> {
     if window.len() < 2 {
         return Err(TrainError::WindowTooShort);
+    }
+    if window.len() > cfg.max_seq_len + 1 {
+        return Err(TrainError::InvalidArgument("window length exceeds max_seq_len + 1"));
+    }
+    if !p.all_finite() {
+        return Err(TrainError::NonFiniteWeights);
+    }
+    if denom <= T::ZERO || !denom.is_finite() {
+        return Err(TrainError::InvalidArgument("denom must be positive and finite"));
+    }
+    if grads.data.len() != p.data.len() {
+        return Err(TrainError::InvalidArgument("grads layout mismatch"));
     }
     let n = window.len() - 1;
     let (tokens, targets) = (&window[..n], &window[1..]);
@@ -379,6 +392,12 @@ pub fn loss_and_grad<T: Float>(
             dlogits[i * vs + j] = (pj - if j == y { T::ONE } else { T::ZERO }) / denom;
         }
     }
+    if n_valid == 0 {
+        return Err(TrainError::NoValidTokens);
+    }
+    if !loss_sum.is_finite() {
+        return Err(TrainError::NonFiniteWeights);
+    }
 
     // ---------------- backward ----------------
     let dxf = mm(&dlogits, n, vs, embed, d);
@@ -487,7 +506,17 @@ pub fn loss_and_grad<T: Float>(
     Ok(LossOut { loss_sum, n_valid })
 }
 
-#[derive(Debug, Clone)]
+/// Forward-only cross-entropy loss calculation without modifying caller's gradients.
+pub fn forward_loss<T: Float>(
+    cfg: &Config,
+    p: &Params<T>,
+    window: &[u32],
+) -> Result<LossOut<T>, TrainError> {
+    let mut dummy_grads = p.zeros_like();
+    loss_and_grad(cfg, p, window, T::ONE, &mut dummy_grads)
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct GradCheckReport {
     pub checked: usize,
     pub failures: usize,
@@ -505,20 +534,47 @@ pub fn gradcheck(
     rtol: f64,
     samples_per_tensor: usize,
 ) -> Result<GradCheckReport, TrainError> {
+    if !params.all_finite() {
+        return Err(TrainError::NonFiniteWeights);
+    }
+    if eps_list.is_empty() || eps_list.iter().any(|&e| !e.is_finite() || e <= 0.0) {
+        return Err(TrainError::InvalidArgument("eps_list must be non-empty with all eps > 0 and finite"));
+    }
+    if samples_per_tensor == 0 {
+        return Err(TrainError::InvalidArgument("samples_per_tensor must be > 0"));
+    }
+    if !(atol.is_finite() && atol >= 0.0 && rtol.is_finite() && rtol >= 0.0) {
+        return Err(TrainError::InvalidArgument("tolerances must be non-negative and finite"));
+    }
+
     let mut scratch = params.zeros_like();
     let probe = loss_and_grad(cfg, params, window, 1.0f64, &mut scratch)?;
     if probe.n_valid == 0 {
         return Err(TrainError::NoValidTokens);
     }
+    if !probe.loss_sum.is_finite() {
+        return Err(TrainError::NonFiniteWeights);
+    }
     let denom = probe.n_valid as f64;
     let mut analytic = params.zeros_like();
     loss_and_grad(cfg, params, window, denom, &mut analytic)?;
+    if !analytic.all_finite() {
+        return Err(TrainError::NonFiniteWeights);
+    }
+
     let mut rep = GradCheckReport { checked: 0, failures: 0, max_abs_err: 0.0, max_rel_err: 0.0 };
     let mut p = params.clone();
     for ti in 0..p.data.len() {
         let len = p.data[ti].len();
         for s in 0..samples_per_tensor {
-            let idx = (s * 2_654_435_761usize + ti * 40_503 + 17) % len;
+            // For embedding table (ti == 0), select coordinate from an actually looked-up token
+            let idx = if ti == 0 && !window.is_empty() {
+                let tok = window[s % window.len()] as usize;
+                let d = cfg.d_model;
+                (tok * d + (s * 31 + 7) % d) % len
+            } else {
+                (s * 2_654_435_761usize + ti * 40_503 + 17) % len
+            };
             for &eps in eps_list {
                 let orig = p.data[ti][idx];
                 let eval = |delta: f64, p: &mut Params<f64>| -> Result<f64, TrainError> {
@@ -530,17 +586,37 @@ pub fn gradcheck(
                 let lp = eval(eps, &mut p)?;
                 let lm = eval(-eps, &mut p)?;
                 p.data[ti][idx] = orig;
+
+                rep.checked += 1;
+                if !lp.is_finite() || !lm.is_finite() {
+                    rep.failures += 1;
+                    continue;
+                }
                 let numeric = (lp - lm) / (2.0 * eps);
                 let a = analytic.data[ti][idx];
+                if !numeric.is_finite() || !a.is_finite() {
+                    rep.failures += 1;
+                    continue;
+                }
                 let err = (a - numeric).abs();
-                rep.checked += 1;
+                if !err.is_finite() {
+                    rep.failures += 1;
+                    continue;
+                }
                 rep.max_abs_err = rep.max_abs_err.max(err);
-                rep.max_rel_err = rep.max_rel_err.max(err / a.abs().max(numeric.abs()).max(1e-12));
-                if err > atol + rtol * a.abs().max(numeric.abs()) {
+                let rel = err / a.abs().max(numeric.abs()).max(1e-12);
+                if rel.is_finite() {
+                    rep.max_rel_err = rep.max_rel_err.max(rel);
+                }
+                let tol = atol + rtol * a.abs().max(numeric.abs());
+                if !tol.is_finite() || err > tol {
                     rep.failures += 1;
                 }
             }
         }
+    }
+    if rep.checked == 0 {
+        return Err(TrainError::InvalidArgument("zero gradient points checked"));
     }
     Ok(rep)
 }
@@ -579,8 +655,50 @@ mod tests {
             let loss = o.loss_sum / denom;
             if step == 0 { initial_loss = loss; }
             final_loss = loss;
-            opt.update(&mut p, &grads, 0.01);
+            assert!(opt.update(&mut p, &grads, 0.01).unwrap());
         }
         assert!(final_loss <= initial_loss * 0.5, "initial={initial_loss}, final={final_loss}");
+    }
+
+    #[test]
+    fn test_loss_and_grad_validation_and_all_pad() {
+        let cfg = Config::reference_v2();
+        let m = Model::init(&cfg).unwrap();
+        let p = Params::<f32>::from_model(&m);
+        let mut grads = p.zeros_like();
+
+        // All-PAD window: window where all targets are pad_id
+        let all_pad_win = [258u32, 258, 258, 258];
+        assert_eq!(
+            loss_and_grad(&cfg, &p, &all_pad_win, 1.0, &mut grads),
+            Err(TrainError::NoValidTokens)
+        );
+
+        // denom = 0 rejected
+        let win = [256u32, 65, 66, 257];
+        assert!(matches!(
+            loss_and_grad(&cfg, &p, &win, 0.0, &mut grads),
+            Err(TrainError::InvalidArgument(_))
+        ));
+
+        // forward_loss matches loss_and_grad
+        let o_fwd = forward_loss(&cfg, &p, &win).unwrap();
+        let o_grad = loss_and_grad(&cfg, &p, &win, 1.0, &mut grads).unwrap();
+        assert_eq!(o_fwd.n_valid, o_grad.n_valid);
+        assert!((o_fwd.loss_sum - o_grad.loss_sum).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_nan_param_gradcheck_rejected() {
+        let cfg = Config::reference_v2();
+        let m = Model::init(&cfg).unwrap();
+        let mut p_f64 = Params::<f64>::from_model(&m);
+        p_f64.data[0][17] = f64::NAN;
+        let window = [256u32, 65, 66, 257];
+        // Must reject, never return Ok with 0 failures
+        assert_eq!(
+            gradcheck(&cfg, &p_f64, &window, &[1e-5], 1e-5, 1e-3, 1),
+            Err(TrainError::NonFiniteWeights)
+        );
     }
 }

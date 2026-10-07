@@ -92,10 +92,11 @@ pub fn rope(x: &Tensor, theta: f32, pos_offset: usize) -> Result<Tensor, TensorE
     }
     let mut out = x.clone();
     for pos in 0..t {
-        let m = (pos_offset + pos) as f32;
+        let m = (pos_offset + pos) as f64;
         for k in 0..dh / 2 {
-            let freq = (theta as f64).powf(-2.0 * k as f64 / dh as f64) as f32;
+            let freq = (theta as f64).powf(-2.0 * k as f64 / dh as f64);
             let (s, c) = (m * freq).sin_cos();
+            let (s, c) = (s as f32, c as f32);
             let (a, b) = (x.data()[pos * dh + 2 * k], x.data()[pos * dh + 2 * k + 1]);
             out.data_mut()[pos * dh + 2 * k] = a * c - b * s;
             out.data_mut()[pos * dh + 2 * k + 1] = a * s + b * c;
@@ -106,22 +107,99 @@ pub fn rope(x: &Tensor, theta: f32, pos_offset: usize) -> Result<Tensor, TensorE
 
 /// Numerically stable softmax over a slice, in place. Entries with `valid=false` get exactly 0.
 pub fn masked_softmax_row(scores: &mut [f32], valid: &[bool]) -> bool {
-    let max = scores
-        .iter()
-        .zip(valid)
-        .filter(|(_, &v)| v)
-        .map(|(&s, _)| s)
-        .fold(f32::NEG_INFINITY, f32::max);
+    if scores.len() != valid.len() {
+        return false;
+    }
+    let mut max = f32::NEG_INFINITY;
+    for (&s, &v) in scores.iter().zip(valid) {
+        if v {
+            if !s.is_finite() {
+                return false;
+            }
+            if s > max {
+                max = s;
+            }
+        }
+    }
     if max == f32::NEG_INFINITY {
         return false;
     }
-    let mut sum = 0.0;
+    let mut sum = 0.0f32;
     for (s, &v) in scores.iter_mut().zip(valid) {
         *s = if v { (*s - max).exp() } else { 0.0 };
         sum += *s;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return false;
     }
     for s in scores.iter_mut() {
         *s /= sum;
     }
     true
+}
+
+/// Numerically stable logsumexp over a slice.
+pub fn logsumexp(x: &[f32]) -> f32 {
+    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return max;
+    }
+    let s: f32 = x.iter().map(|&v| (v - max).exp()).sum();
+    max + s.ln()
+}
+
+/// Sum tensor along axis 0 or 1.
+pub fn sum_axis(t: &Tensor, axis: usize) -> Result<Tensor, TensorError> {
+    let (rows, cols) = rank2(t)?;
+    match axis {
+        0 => {
+            let mut out = vec![0.0f32; cols];
+            for r in 0..rows {
+                for c in 0..cols {
+                    out[c] += t.data()[r * cols + c];
+                }
+            }
+            Tensor::from_vec(&[cols], out)
+        }
+        1 => {
+            let mut out = vec![0.0f32; rows];
+            for r in 0..rows {
+                for c in 0..cols {
+                    out[r] += t.data()[r * cols + c];
+                }
+            }
+            Tensor::from_vec(&[rows], out)
+        }
+        _ => Err(TensorError::InvalidArgument("axis out of bounds")),
+    }
+}
+
+/// Batched matmul `[B, M, K] x [B, K, N] -> [B, M, N]`.
+pub fn batched_matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, TensorError> {
+    if a.shape().len() != 3 || b.shape().len() != 3 {
+        return Err(TensorError::Rank { expected: 3, actual: a.shape().len() });
+    }
+    let (b_a, m, k_a) = (a.shape()[0], a.shape()[1], a.shape()[2]);
+    let (b_b, k_b, n) = (b.shape()[0], b.shape()[1], b.shape()[2]);
+    if b_a != b_b || k_a != k_b {
+        return Err(TensorError::ShapeMismatch {
+            expected: vec![b_a, k_a, n],
+            actual: vec![b_b, k_b, n],
+        });
+    }
+    let mut out = Tensor::zeros(&[b_a, m, n])?;
+    for bi in 0..b_a {
+        let a_slice = &a.data()[bi * m * k_a..(bi + 1) * m * k_a];
+        let b_slice = &b.data()[bi * k_a * n..(bi + 1) * k_a * n];
+        let out_slice = &mut out.data_mut()[bi * m * n..(bi + 1) * m * n];
+        for i in 0..m {
+            for p in 0..k_a {
+                let av = a_slice[i * k_a + p];
+                for j in 0..n {
+                    out_slice[i * n + j] += av * b_slice[p * n + j];
+                }
+            }
+        }
+    }
+    Ok(out)
 }

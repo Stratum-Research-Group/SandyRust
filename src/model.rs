@@ -14,6 +14,7 @@ pub enum ModelError {
     SequenceTooLong { len: usize, max: usize },
     TokenOutOfRange { token: u32, vocab: usize },
     Inventory(&'static str),
+    Cache(String),
 }
 
 impl From<TensorError> for ModelError {
@@ -27,7 +28,7 @@ impl From<ConfigError> for ModelError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Layer {
     pub rms1: Tensor,
     pub wq: Tensor,
@@ -40,7 +41,7 @@ pub struct Layer {
     pub w_down: Tensor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pub cfg: Config,
     pub embed: Tensor,
@@ -134,6 +135,10 @@ impl Model {
         Ok(Model { cfg: cfg.clone(), embed, layers, final_norm })
     }
 
+    pub fn from_params(cfg: &Config, p: &crate::autodiff::Params<f32>) -> Result<Self, ModelError> {
+        p.to_model(cfg)
+    }
+
     /// Tensors in inventory order.
     pub fn tensors(&self) -> Vec<(String, &Tensor)> {
         let names = inventory(&self.cfg);
@@ -147,6 +152,19 @@ impl Model {
 
     pub fn param_count(&self) -> usize {
         self.tensors().iter().map(|(_, t)| t.len()).sum()
+    }
+
+    /// Cryptographic SHA-256 fingerprint of config and all model weights.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.cfg.fingerprint());
+        for (name, t) in self.tensors() {
+            bytes.extend_from_slice(name.as_bytes());
+            for x in t.data() {
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        crate::sha256::sha256(&bytes)
     }
 
     /// Full forward for one sequence: tokens `[T]` -> logits `[T, V]`.

@@ -28,6 +28,21 @@ pub struct SamplingParams {
     pub seed: u64,
 }
 
+impl SamplingParams {
+    pub fn validate(&self) -> Result<(), GenerationError> {
+        if !(self.temperature.is_finite() && self.temperature >= 0.0) {
+            return Err(GenerationError::InvalidHyperparameter("temperature"));
+        }
+        if self.top_k < 1 {
+            return Err(GenerationError::InvalidHyperparameter("top_k"));
+        }
+        if !(self.top_p.is_finite() && self.top_p > 0.0 && self.top_p <= 1.0) {
+            return Err(GenerationError::InvalidHyperparameter("top_p"));
+        }
+        Ok(())
+    }
+}
+
 impl Default for SamplingParams {
     fn default() -> Self {
         SamplingParams { temperature: 0.0, top_k: usize::MAX, top_p: 1.0, max_new_tokens: 32, seed: 0 }
@@ -40,6 +55,7 @@ pub struct GenerationOutput {
     /// Logits at position `T_prompt + T_gen - 1` (last position evaluated).
     pub final_logits: Vec<f32>,
     pub stopped_on_eos: bool,
+    pub terminal_pos: usize,
 }
 
 fn disallowed(id: usize) -> bool {
@@ -48,6 +64,7 @@ fn disallowed(id: usize) -> bool {
 
 /// Choose the next token from raw logits. Ties break to the smallest token id.
 pub fn sample_next(logits: &[f32], p: &SamplingParams, rng: &mut Rng, position: usize) -> Result<u32, GenerationError> {
+    p.validate()?;
     if logits.iter().any(|x| !x.is_finite()) {
         return Err(GenerationError::NonFiniteLogits { position });
     }
@@ -129,6 +146,7 @@ fn renorm(c: &mut [(usize, f32)]) -> Result<(), GenerationError> {
 }
 
 pub fn generate(model: &Model, prompt: &[u32], p: &SamplingParams) -> Result<GenerationOutput, GenerationError> {
+    p.validate()?;
     let max_len = model.cfg.max_seq_len;
     if prompt.is_empty() {
         return Err(GenerationError::PromptEmpty);
@@ -145,15 +163,6 @@ pub fn generate(model: &Model, prompt: &[u32], p: &SamplingParams) -> Result<Gen
         .ok_or(GenerationError::CapacityExceeded { total_requested: usize::MAX, max_len })?;
     if total > max_len {
         return Err(GenerationError::CapacityExceeded { total_requested: total, max_len });
-    }
-    if !(p.temperature.is_finite() && p.temperature >= 0.0) {
-        return Err(GenerationError::InvalidHyperparameter("temperature"));
-    }
-    if p.top_k < 1 {
-        return Err(GenerationError::InvalidHyperparameter("top_k"));
-    }
-    if !(p.top_p > 0.0 && p.top_p <= 1.0) {
-        return Err(GenerationError::InvalidHyperparameter("top_p"));
     }
     let mut rng = Rng::new(p.seed);
     let mut seq = prompt.to_vec();
@@ -173,7 +182,17 @@ pub fn generate(model: &Model, prompt: &[u32], p: &SamplingParams) -> Result<Gen
         seq.push(next);
         out.push(next);
     }
-    Ok(GenerationOutput { tokens: out, final_logits: last_logits, stopped_on_eos: eos })
+
+    // Terminal position contract (§8.3, Item 7):
+    // If tokens were generated and stopped due to budget (not EOS), evaluate the terminal position.
+    let terminal_pos = seq.len() - 1;
+    if !eos && !out.is_empty() {
+        let logits = model.forward(&seq, None).map_err(|e| GenerationError::Forward(format!("{e:?}")))?;
+        let v = model.cfg.vocab_size;
+        last_logits = logits.data()[terminal_pos * v..(terminal_pos + 1) * v].to_vec();
+    }
+
+    Ok(GenerationOutput { tokens: out, final_logits: last_logits, stopped_on_eos: eos, terminal_pos })
 }
 
 #[cfg(test)]
@@ -252,5 +271,40 @@ mod tests {
             sample_next(&[], &SamplingParams { temperature: 0.0, ..Default::default() }, &mut r, 0),
             Err(GenerationError::EmptyFilteredDistribution)
         );
+        assert_eq!(
+            sample_next(&[1.0], &SamplingParams { top_k: 0, ..Default::default() }, &mut r, 0),
+            Err(GenerationError::InvalidHyperparameter("top_k"))
+        );
+        assert_eq!(
+            sample_next(&[1.0], &SamplingParams { top_p: -0.1, ..Default::default() }, &mut r, 0),
+            Err(GenerationError::InvalidHyperparameter("top_p"))
+        );
+    }
+
+    #[test]
+    fn terminal_logits_parity_g12() {
+        let m = model();
+        let prompt = [256u32, 65];
+        // 1 new token
+        let p1 = SamplingParams { max_new_tokens: 1, ..Default::default() };
+        let out1 = generate(&m, &prompt, &p1).unwrap();
+        assert_eq!(out1.tokens.len(), 1);
+        let mut full_seq1 = prompt.to_vec();
+        full_seq1.extend_from_slice(&out1.tokens);
+        let fwd1 = m.forward(&full_seq1, None).unwrap();
+        let v = m.cfg.vocab_size;
+        let pos1 = full_seq1.len() - 1;
+        assert_eq!(out1.terminal_pos, pos1);
+        assert_eq!(out1.final_logits, &fwd1.data()[pos1 * v..(pos1 + 1) * v]);
+
+        // 3 new tokens
+        let p3 = SamplingParams { max_new_tokens: 3, ..Default::default() };
+        let out3 = generate(&m, &prompt, &p3).unwrap();
+        let mut full_seq3 = prompt.to_vec();
+        full_seq3.extend_from_slice(&out3.tokens);
+        let fwd3 = m.forward(&full_seq3, None).unwrap();
+        let pos3 = full_seq3.len() - 1;
+        assert_eq!(out3.terminal_pos, pos3);
+        assert_eq!(out3.final_logits, &fwd3.data()[pos3 * v..(pos3 + 1) * v]);
     }
 }

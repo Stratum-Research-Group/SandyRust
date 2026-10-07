@@ -42,37 +42,97 @@ impl Schedule {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AdamW {
     pub m: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
     pub step: u64,
+    pub consecutive_skips: usize,
 }
 
 impl AdamW {
     pub fn new(p: &Params<f32>) -> Self {
-        AdamW { m: p.zeros_like().data, v: p.zeros_like().data, step: 0 }
+        AdamW {
+            m: p.zeros_like().data,
+            v: p.zeros_like().data,
+            step: 0,
+            consecutive_skips: 0,
+        }
     }
 
-    /// One update at learning rate `eta`. Weight decay applies to 2-D tensors only.
-    pub fn update(&mut self, params: &mut Params<f32>, grads: &Params<f32>, eta: f32) {
-        self.step += 1;
-        let t = self.step.min(i32::MAX as u64) as i32;
+    /// Update parameters with decoupled weight decay.
+    ///
+    /// - Returns `Ok(true)` if finite gradients and candidate weights were committed.
+    /// - Returns `Ok(false)` if gradients were non-finite (skips step without mutating `m`, `v`, `step`, or `params`).
+    /// - Returns `Err(TrainError)` if >5 consecutive non-finite skips occur, or candidate weights are non-finite.
+    pub fn update(&mut self, params: &mut Params<f32>, grads: &Params<f32>, eta: f32) -> Result<bool, TrainError> {
+        if !grads.all_finite() {
+            self.consecutive_skips += 1;
+            if self.consecutive_skips > 5 {
+                return Err(TrainError::InvalidArgument("exceeded 5 consecutive non-finite gradient skips"));
+            }
+            return Ok(false);
+        }
+        if !params.all_finite() {
+            return Err(TrainError::NonFiniteWeights);
+        }
+        if !(eta.is_finite() && eta >= 0.0) {
+            return Err(TrainError::InvalidArgument("eta must be finite and non-negative"));
+        }
+
+        let next_step = self.step + 1;
+        let t = next_step.min(i32::MAX as u64) as i32;
         let bc1 = (1.0 - (BETA1 as f64).powi(t)) as f32;
         let bc2 = (1.0 - (BETA2 as f64).powi(t)) as f32;
+
+        let mut next_m = self.m.clone();
+        let mut next_v = self.v.clone();
+        let mut next_params = params.clone();
+
         for ti in 0..params.data.len() {
             let decay = params.shapes[ti].len() == 2;
             for i in 0..params.data[ti].len() {
                 let g = grads.data[ti][i];
                 let m = BETA1 * self.m[ti][i] + (1.0 - BETA1) * g;
                 let v = BETA2 * self.v[ti][i] + (1.0 - BETA2) * g * g;
-                self.m[ti][i] = m;
-                self.v[ti][i] = v;
+                next_m[ti][i] = m;
+                next_v[ti][i] = v;
                 let w = params.data[ti][i];
                 let upd = (m / bc1) / ((v / bc2).sqrt() + ADAM_EPS) + if decay { WEIGHT_DECAY * w } else { 0.0 };
-                params.data[ti][i] = w - eta * upd;
+                let cand_w = w - eta * upd;
+                if !cand_w.is_finite() {
+                    return Err(TrainError::NonFiniteWeights);
+                }
+                next_params.data[ti][i] = cand_w;
             }
         }
+
+        // Commit transaction
+        self.step = next_step;
+        self.consecutive_skips = 0;
+        self.m = next_m;
+        self.v = next_v;
+        *params = next_params;
+        Ok(true)
+    }
+
+    /// Atomic step with global norm clipping.
+    pub fn step_with_clipping(
+        &mut self,
+        params: &mut Params<f32>,
+        grads: &mut Params<f32>,
+        eta: f32,
+        max_norm: f32,
+    ) -> Result<bool, TrainError> {
+        if !grads.all_finite() {
+            self.consecutive_skips += 1;
+            if self.consecutive_skips > 5 {
+                return Err(TrainError::InvalidArgument("exceeded 5 consecutive non-finite gradient skips"));
+            }
+            return Ok(false);
+        }
+        clip_global_norm(grads, max_norm);
+        self.update(params, grads, eta)
     }
 }
 
@@ -120,12 +180,39 @@ mod tests {
         let mut p = Params::<f32> { shapes: vec![vec![2], vec![1, 2]], data: vec![vec![1.0, 1.0], vec![1.0, 1.0]] };
         let zero = p.zeros_like();
         let mut o = AdamW::new(&p);
-        o.update(&mut p, &zero, 0.1);
+        assert!(o.update(&mut p, &zero, 0.1).unwrap());
         assert_eq!(p.data[0], [1.0, 1.0]); // 1-D: no decay, zero grad => unchanged
         assert!(p.data[1][0] < 1.0); // 2-D: decayed
         let mut g = Params::<f32> { shapes: vec![vec![2]], data: vec![vec![3.0, 4.0]] };
         let n = clip_global_norm(&mut g, 1.0);
         assert!((n - 5.0).abs() < 1e-6);
         assert!((g.data[0][0] - 0.6).abs() < 1e-6 && (g.data[0][1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn adamw_skips_non_finite_without_mutating_state() {
+        let mut p = Params::<f32> { shapes: vec![vec![2]], data: vec![vec![1.0, 2.0]] };
+        let orig_p = p.clone();
+        let mut o = AdamW::new(&p);
+        let orig_m = o.m.clone();
+        let orig_v = o.v.clone();
+
+        // Pass NaN gradient
+        let nan_g = Params::<f32> { shapes: vec![vec![2]], data: vec![vec![f32::NAN, 1.0]] };
+        let res = o.update(&mut p, &nan_g, 0.1);
+        assert_eq!(res, Ok(false)); // Skipped
+        assert_eq!(o.step, 0); // Step unchanged
+        assert_eq!(o.consecutive_skips, 1);
+        assert_eq!(o.m, orig_m); // Moments unchanged
+        assert_eq!(o.v, orig_v);
+        assert_eq!(p.data, orig_p.data); // Params unchanged
+
+        // Up to 5 skips allowed
+        for _ in 1..5 {
+            assert_eq!(o.update(&mut p, &nan_g, 0.1), Ok(false));
+        }
+        assert_eq!(o.consecutive_skips, 5);
+        // 6th consecutive skip must return error
+        assert!(o.update(&mut p, &nan_g, 0.1).is_err());
     }
 }

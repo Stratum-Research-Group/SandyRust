@@ -3,16 +3,16 @@
   "gate_id": "G14",
   "status": "PASS",
   "reason": null,
-  "revision": "unversioned",
-  "fixture_hash": "n/a-analytic",
+  "revision": "1a5fde2",
+  "fixture_hash": "g14-resource-caps-v1",
   "config": "reference_v2",
   "command": "cargo run -- verify",
   "backend": "cpu_reference",
   "device": "cpu",
   "dtype": "fp32",
-  "expected": "oversize + capacity overflow rejected without panic",
-  "observed": "oversize=true capacity=true",
+  "expected": "oversize, capacity, rank mismatch, all-PAD, and config cap rejected without panic",
+  "observed": "oversize=true cap=true rank=true pad=true cfg_cap=true",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 30
+  "execution_time_ms": 28
 }

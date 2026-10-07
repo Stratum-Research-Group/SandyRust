@@ -10,6 +10,7 @@ pub enum ConfigError {
     SpecialTokens(&'static str),
     ResourceCap(&'static str),
     UnsupportedSchema(u32),
+    ExtensionNotEnabled(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -41,6 +42,10 @@ pub struct Config {
 
 pub const MAX_SEQ_CAP: usize = 8192;
 pub const MAX_BATCH_CAP: usize = 256;
+pub const MAX_LAYERS_CAP: usize = 32;
+pub const MAX_D_MODEL_CAP: usize = 2048;
+pub const MAX_VOCAB_CAP: usize = 65536;
+pub const MAX_PARAM_BYTES_CAP: usize = 128 * 1024 * 1024; // 128 MiB
 
 impl Config {
     /// `reference_v2` baseline: MHA, tied, V=259, D=128, L=4, P=886,272.
@@ -67,6 +72,18 @@ impl Config {
 
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_q_heads
+    }
+
+    /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let s = format!(
+            "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th{:.6}:eps{:.8}:bos{}:eos{}:pad{}:tied{}:seed{}",
+            self.schema_version, self.vocab_size, self.d_model, self.n_layers,
+            self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
+            self.batch_size, self.rope_theta, self.rms_eps,
+            self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed
+        );
+        crate::sha256::sha256(s.as_bytes())
     }
 
     /// Validate every precondition of §3.6 before any allocation.
@@ -120,6 +137,29 @@ impl Config {
         if self.batch_size > MAX_BATCH_CAP {
             return Err(ConfigError::ResourceCap("batch_size"));
         }
+        if self.n_layers > MAX_LAYERS_CAP {
+            return Err(ConfigError::ResourceCap("n_layers"));
+        }
+        if self.d_model > MAX_D_MODEL_CAP {
+            return Err(ConfigError::ResourceCap("d_model"));
+        }
+        if self.vocab_size > MAX_VOCAB_CAP {
+            return Err(ConfigError::ResourceCap("vocab_size"));
+        }
+        let p_count = self.param_count().ok_or(ConfigError::ResourceCap("param_count overflow"))?;
+        let param_bytes = p_count.checked_mul(4).ok_or(ConfigError::ResourceCap("param_bytes overflow"))?;
+        if param_bytes > MAX_PARAM_BYTES_CAP {
+            return Err(ConfigError::ResourceCap("total param bytes exceeds MAX_PARAM_BYTES_CAP"));
+        }
+
+        // Strict baseline extension rejection: baseline must be tied MHA
+        if !self.tied_embeddings {
+            return Err(ConfigError::ExtensionNotEnabled("tied_embeddings=false is extension X2, disabled in baseline"));
+        }
+        if self.n_kv_heads != self.n_q_heads {
+            return Err(ConfigError::ExtensionNotEnabled("n_kv_heads != n_q_heads is extension X1 (GQA/MQA), disabled in baseline"));
+        }
+
         Ok(())
     }
 
@@ -163,10 +203,12 @@ mod tests {
         let mut c = Config::reference_v2();
         c.tied_embeddings = false;
         assert_eq!(c.param_count(), Some(919_424));
+        assert!(matches!(c.validate(), Err(ConfigError::ExtensionNotEnabled(_))));
         c.n_kv_heads = 2;
         assert_eq!(c.param_count(), Some(853_888));
         c.tied_embeddings = true;
         assert_eq!(c.param_count(), Some(820_736));
+        assert!(matches!(c.validate(), Err(ConfigError::ExtensionNotEnabled(_))));
         c.n_kv_heads = 1;
         assert_eq!(c.param_count(), Some(787_968));
         c.tied_embeddings = false;
@@ -196,6 +238,9 @@ mod tests {
         let mut c = Config::reference_v2();
         c.max_seq_len = MAX_SEQ_CAP + 1;
         assert!(c.validate().is_err());
+        let mut c = Config::reference_v2();
+        c.n_layers = MAX_LAYERS_CAP + 1;
+        assert!(matches!(c.validate(), Err(ConfigError::ResourceCap(_))));
         let mut c = Config::reference_v2();
         c.schema_version = 2;
         assert!(c.validate().is_err());

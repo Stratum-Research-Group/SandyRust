@@ -2,12 +2,20 @@ use sandy_rust::checkpoint::{self, DEFAULT_MAX_BYTES};
 use sandy_rust::config::Config;
 use sandy_rust::generation::{generate, SamplingParams};
 use sandy_rust::model::Model;
+use sandy_rust::optimizer::{AdamW, Schedule};
 use sandy_rust::tokenizer::{ByteTokenizer, BOS};
 use sandy_rust::gates;
-use std::{env, fs, path::Path, process::ExitCode};
+use std::{env, fs, path::Path, process::ExitCode, str::FromStr};
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+}
+
+fn parse_flag<T: FromStr>(args: &[String], name: &str, default: T) -> Result<T, String> {
+    match flag(args, name) {
+        Some(val) => val.parse::<T>().map_err(|_| format!("invalid value for flag {name}: '{val}'")),
+        None => Ok(default),
+    }
 }
 
 fn main() -> ExitCode {
@@ -16,9 +24,19 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("verify") => {
             let list = flag(&args, "--gates").unwrap_or("g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14");
-            let ids: Vec<&str> = list.split(',').collect();
-            let reports = gates::run(&ids);
-            let _ = fs::create_dir_all("artifacts");
+            let ids: Vec<&str> = list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let reports = match gates::run(&ids) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("verify error: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let art_dir = flag(&args, "--artifacts").unwrap_or("artifacts");
+            if let Err(e) = fs::create_dir_all(art_dir) {
+                eprintln!("failed to create evidence directory '{art_dir}': {e}");
+                return ExitCode::FAILURE;
+            }
             let mut failed = false;
             for r in &reports {
                 if let Some(reason) = &r.reason {
@@ -26,8 +44,14 @@ fn main() -> ExitCode {
                 } else {
                     println!("{} {}", r.gate_id, r.status);
                 }
-                failed |= r.status == "FAIL";
-                let _ = fs::write(format!("artifacts/{}.json", r.gate_id), r.to_json());
+                if r.status != "PASS" && r.status != "NOT RUN" {
+                    failed = true;
+                }
+                let path = format!("{art_dir}/{}.json", r.gate_id);
+                if let Err(e) = fs::write(&path, r.to_json()) {
+                    eprintln!("failed to write artifact '{path}': {e}");
+                    return ExitCode::FAILURE;
+                }
             }
             if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
@@ -63,12 +87,34 @@ fn main() -> ExitCode {
             let tok = ByteTokenizer::new();
             let mut prompt = vec![BOS];
             prompt.extend(tok.encode(flag(&args, "--prompt").unwrap_or("Rust")));
+
+            let temp: f32 = match parse_flag(&args, "--temperature", 0.0f32) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let top_k: usize = match parse_flag(&args, "--top-k", usize::MAX) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let top_p: f32 = match parse_flag(&args, "--top-p", 1.0f32) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let max_new_tokens: usize = match parse_flag(&args, "--max-tokens", 16usize) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let seed: u64 = match parse_flag(&args, "--seed", 0u64) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+
             let params = SamplingParams {
-                temperature: flag(&args, "--temperature").and_then(|v| v.parse().ok()).unwrap_or(0.0),
-                top_k: flag(&args, "--top-k").and_then(|v| v.parse().ok()).unwrap_or(usize::MAX),
-                top_p: flag(&args, "--top-p").and_then(|v| v.parse().ok()).unwrap_or(1.0),
-                max_new_tokens: flag(&args, "--max-tokens").and_then(|v| v.parse().ok()).unwrap_or(16),
-                seed: flag(&args, "--seed").and_then(|v| v.parse().ok()).unwrap_or(0),
+                temperature: temp,
+                top_k,
+                top_p,
+                max_new_tokens,
+                seed,
             };
             match generate(&model, &prompt, &params) {
                 Ok(out) => {
@@ -78,8 +124,87 @@ fn main() -> ExitCode {
                 Err(e) => { eprintln!("generation error: {e:?}"); ExitCode::FAILURE }
             }
         }
+        Some("gradcheck") => {
+            let m = Model::init(&cfg).expect("model init");
+            let p_f64 = sandy_rust::autodiff::Params::<f64>::from_model(&m);
+            let window = [256u32, 65, 66, 65, 257];
+            println!("Running analytic vs finite-difference gradcheck on reference_v2 (f64)...");
+            match sandy_rust::autodiff::gradcheck(&cfg, &p_f64, &window, &[1e-5, 1e-6, 1e-7], 1e-5, 1e-3, 1) {
+                Ok(rep) => {
+                    println!(
+                        "Checked {} coordinates. Failures: {}. Max abs err: {:e}, max rel err: {:e}",
+                        rep.checked, rep.failures, rep.max_abs_err, rep.max_rel_err
+                    );
+                    if rep.failures == 0 {
+                        println!("PASS: gradcheck verified");
+                        ExitCode::SUCCESS
+                    } else {
+                        eprintln!("FAIL: gradcheck failures detected");
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => {
+                    eprintln!("gradcheck error: {e:?}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("train") => {
+            let steps: usize = match parse_flag(&args, "--steps", 20usize) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let lr: f32 = match parse_flag(&args, "--lr", 0.01f32) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            println!("Starting bounded train smoke test: steps={steps}, lr={lr}...");
+            let m = Model::init(&cfg).expect("model init");
+            let mut p = sandy_rust::autodiff::Params::<f32>::from_model(&m);
+            let mut opt = AdamW::new(&p);
+            let sched = Schedule { eta_max: lr, eta_min: lr * 0.1, warmup: (steps / 5).max(1) as u64, max_steps: steps as u64 };
+            let train_window = [256u32, 65, 66, 67, 257];
+            let val_window = [256u32, 68, 69, 70, 257];
+
+            for step in 1..=steps {
+                let mut grads = p.zeros_like();
+                let o = match sandy_rust::autodiff::loss_and_grad(&cfg, &p, &train_window, train_window.len().saturating_sub(1) as f32, &mut grads) {
+                    Ok(o) => o,
+                    Err(e) => { eprintln!("training step {step} error: {e:?}"); return ExitCode::FAILURE; }
+                };
+                let train_loss = o.loss_sum / o.n_valid as f32;
+                let eta = sched.eta(step as u64);
+                if let Err(e) = opt.step_with_clipping(&mut p, &mut grads, eta, 1.0) {
+                    eprintln!("optimizer step {step} error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+                if step % (steps / 5).max(1) == 0 || step == steps {
+                    let val_out = match sandy_rust::autodiff::forward_loss(&cfg, &p, &val_window) {
+                        Ok(l) => l,
+                        Err(e) => { eprintln!("eval error: {e:?}"); return ExitCode::FAILURE; }
+                    };
+                    let val_loss = val_out.loss_sum / val_out.n_valid as f32;
+                    println!("step {step:3}/{steps} | train_loss: {train_loss:.4} | val_loss: {val_loss:.4} | lr: {eta:.6}");
+                }
+            }
+            if let Some(ckpt_path) = flag(&args, "--checkpoint") {
+                let updated_model = Model::from_params(&cfg, &p).expect("model from params");
+                if let Err(e) = checkpoint::save(&updated_model, Path::new(ckpt_path)) {
+                    eprintln!("checkpoint save error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+                println!("saved final checkpoint to {ckpt_path}");
+            }
+            ExitCode::SUCCESS
+        }
         _ => {
-            eprintln!("usage: sandy_rust verify [--gates g1,g2,...] | checkpoint --init|--inspect <path> | generate [--prompt s] [--max-tokens n] [--temperature t] [--top-k k] [--top-p p] [--seed n] [--checkpoint path]");
+            eprintln!("usage: sandy_rust <command> [options]");
+            eprintln!("commands:");
+            eprintln!("  verify      [--gates g1,g2,...] [--artifacts <dir>]");
+            eprintln!("  train       [--steps n] [--lr f] [--checkpoint path]");
+            eprintln!("  gradcheck");
+            eprintln!("  checkpoint  --init <path> | --inspect <path>");
+            eprintln!("  generate    [--prompt s] [--max-tokens n] [--temperature t] [--top-k k] [--top-p p] [--seed n] [--checkpoint path]");
             ExitCode::from(2)
         }
     }

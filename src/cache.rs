@@ -21,9 +21,19 @@ impl From<TensorError> for CacheError {
     }
 }
 
+impl From<CacheError> for ModelError {
+    fn from(e: CacheError) -> Self {
+        match e {
+            CacheError::Tensor(t) => ModelError::Tensor(t),
+            other => ModelError::Cache(format!("{other:?}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KVCache {
-    pub model_id: u64,
+    pub model_fingerprint: [u8; 32],
+    pub config_fingerprint: [u8; 32],
     pub session_id: u64,
     pub max_seq_len: usize,
     pub seq_len: usize,
@@ -34,7 +44,11 @@ pub struct KVCache {
 }
 
 impl KVCache {
-    pub fn new(cfg: &Config, model_id: u64, session_id: u64) -> Result<Self, CacheError> {
+    pub fn new(cfg: &Config, model_fingerprint: [u8; 32], session_id: u64) -> Result<Self, CacheError> {
+        cfg.validate().map_err(|_| TensorError::InvalidArgument("invalid config"))?;
+        if cfg.n_q_heads == 0 || cfg.n_kv_heads == 0 {
+            return Err(TensorError::InvalidArgument("n_heads == 0").into());
+        }
         let kv_dim = cfg.n_kv_heads * cfg.head_dim();
         let max_seq = cfg.max_seq_len;
         let mut k = Vec::with_capacity(cfg.n_layers);
@@ -44,7 +58,8 @@ impl KVCache {
             v.push(Tensor::zeros(&[max_seq, kv_dim])?);
         }
         Ok(KVCache {
-            model_id,
+            model_fingerprint,
+            config_fingerprint: cfg.fingerprint(),
             session_id,
             max_seq_len: max_seq,
             seq_len: 0,
@@ -79,6 +94,9 @@ impl KVCache {
         if layer >= self.k.len() {
             return Err(CacheError::LayerOutOfBounds { layer, total: self.k.len() });
         }
+        if pos >= self.max_seq_len {
+            return Err(CacheError::CapacityExceeded { current: self.seq_len, requested: 1, max: self.max_seq_len });
+        }
         if pos != self.seq_len {
             return Err(CacheError::PositionMismatch { expected: self.seq_len, actual: pos });
         }
@@ -107,9 +125,16 @@ fn slice_cols(t: &Tensor, start: usize, len: usize) -> Result<Tensor, TensorErro
 }
 
 /// Execute a single incremental decoding step using the contiguous KV cache.
+/// Enforces model identity, transactional rollback on mid-step failure, and exact forward equivalence.
 pub fn forward_step(model: &Model, token: u32, pos: usize, cache: &mut KVCache) -> Result<Tensor, ModelError> {
     let c = &model.cfg;
-    if pos >= c.max_seq_len {
+    if cache.model_fingerprint != model.fingerprint() {
+        return Err(CacheError::BindingMismatch("model fingerprint mismatch").into());
+    }
+    if cache.config_fingerprint != c.fingerprint() {
+        return Err(CacheError::BindingMismatch("config fingerprint mismatch").into());
+    }
+    if pos >= c.max_seq_len || pos >= cache.max_seq_len {
         return Err(ModelError::SequenceTooLong { len: pos + 1, max: c.max_seq_len });
     }
     if pos != cache.seq_len {
@@ -119,6 +144,9 @@ pub fn forward_step(model: &Model, token: u32, pos: usize, cache: &mut KVCache) 
     if token as usize >= c.vocab_size {
         return Err(ModelError::TokenOutOfRange { token, vocab: c.vocab_size });
     }
+
+    let mut staged_k = Vec::with_capacity(c.n_layers);
+    let mut staged_v = Vec::with_capacity(c.n_layers);
 
     let mut x = model.embed.gather_rows(&[token as usize])?;
     let (dh, group) = (c.head_dim(), c.n_q_heads / c.n_kv_heads);
@@ -141,19 +169,29 @@ pub fn forward_step(model: &Model, token: u32, pos: usize, cache: &mut KVCache) 
             k_rope.data_mut()[kvh * dh..(kvh + 1) * dh].copy_from_slice(col_r.data());
         }
 
-        // Store k_rope and v into cache for this layer
-        cache.append_step(l_idx, k_rope.data(), v.data(), pos).map_err(|_e| TensorError::InvalidArgument("cache append"))?;
+        staged_k.push(k_rope);
+        staged_v.push(v);
 
-        // Extract cached slices for 0..=pos
-        let cached_k_slice = slice_rows(&cache.k[l_idx], 0, k_len)?;
-        let cached_v_slice = slice_rows(&cache.v[l_idx], 0, k_len)?;
+        // History 0..pos from cache plus current step pos
+        let cached_k_prev = if pos > 0 { slice_rows(&cache.k[l_idx], 0, pos)? } else { Tensor::zeros(&[0, kv_dim])? };
+        let cached_v_prev = if pos > 0 { slice_rows(&cache.v[l_idx], 0, pos)? } else { Tensor::zeros(&[0, kv_dim])? };
+
+        let mut current_k = Vec::with_capacity(k_len * kv_dim);
+        current_k.extend_from_slice(cached_k_prev.data());
+        current_k.extend_from_slice(staged_k[l_idx].data());
+        let current_k_tensor = Tensor::from_vec(&[k_len, kv_dim], current_k)?;
+
+        let mut current_v = Vec::with_capacity(k_len * kv_dim);
+        current_v.extend_from_slice(cached_v_prev.data());
+        current_v.extend_from_slice(staged_v[l_idx].data());
+        let current_v_tensor = Tensor::from_vec(&[k_len, kv_dim], current_v)?;
 
         let mut merged = Tensor::zeros(&[1, c.n_q_heads * dh])?;
         for h in 0..c.n_q_heads {
             let kvh = h / group;
             let qh = rope(&slice_cols(&q, h * dh, dh)?, c.rope_theta, pos)?;
-            let kh = slice_cols(&cached_k_slice, kvh * dh, dh)?;
-            let vh = slice_cols(&cached_v_slice, kvh * dh, dh)?;
+            let kh = slice_cols(&current_k_tensor, kvh * dh, dh)?;
+            let vh = slice_cols(&current_v_tensor, kvh * dh, dh)?;
             let (o, _) = attention_ref(&qh, &kh, &vh, &q_valid, &k_valid, pos)?;
             merged.data_mut()[h * dh..(h + 1) * dh].copy_from_slice(o.data());
         }
@@ -164,9 +202,17 @@ pub fn forward_step(model: &Model, token: u32, pos: usize, cache: &mut KVCache) 
         x = add(&x, &matmul(&hidden, &l.w_down)?)?;
     }
 
-    cache.commit_step();
     let x = rms_norm(&x, &model.final_norm, c.rms_eps)?;
-    Ok(matmul(&x, &model.embed.transpose2d()?)?)
+    let logits = matmul(&x, &model.embed.transpose2d()?)?;
+
+    // Commit only after complete step succeeds
+    for l_idx in 0..c.n_layers {
+        cache.append_step(l_idx, staged_k[l_idx].data(), staged_v[l_idx].data(), pos)
+            .map_err(|_| TensorError::InvalidArgument("cache append"))?;
+    }
+    cache.commit_step();
+
+    Ok(logits)
 }
 
 fn slice_rows(t: &Tensor, start: usize, len: usize) -> Result<Tensor, TensorError> {
@@ -187,12 +233,10 @@ mod tests {
         let model = Model::init(&cfg).unwrap();
         let tokens = [256u32, 72, 101, 108, 108, 111]; // "Hello"
 
-        // Full-sequence non-cached forward pass
         let full_logits = model.forward(&tokens, None).unwrap();
         let v = cfg.vocab_size;
 
-        // Incremental cached single-step decode
-        let mut cache = KVCache::new(&cfg, 0x1234, 1).unwrap();
+        let mut cache = KVCache::new(&cfg, model.fingerprint(), 1).unwrap();
         for (pos, &tok) in tokens.iter().enumerate() {
             let step_logits = forward_step(&model, tok, pos, &mut cache).unwrap();
             assert_eq!(step_logits.shape(), &[1, v]);
@@ -203,5 +247,31 @@ mod tests {
                 assert!(diff <= 1e-4 + 1e-4 * a.abs(), "pos={pos}, token={i}: diff={diff}, full={a}, cached={b}");
             }
         }
+    }
+
+    #[test]
+    fn test_kv_cache_rejects_stale_model_or_config() {
+        let cfg = Config::reference_v2();
+        let model = Model::init(&cfg).unwrap();
+        let mut cache = KVCache::new(&cfg, model.fingerprint(), 1).unwrap();
+
+        // Mutate model weight to change fingerprint
+        let mut model_changed = model.clone();
+        model_changed.embed.data_mut()[0] += 1.0;
+        let res = forward_step(&model_changed, 256, 0, &mut cache);
+        assert!(matches!(res, Err(ModelError::Cache(_))));
+        assert_eq!(cache.seq_len, 0); // Cache untouched
+    }
+
+    #[test]
+    fn test_append_step_capacity_bounds() {
+        let cfg = Config::reference_v2();
+        let model = Model::init(&cfg).unwrap();
+        let mut cache = KVCache::new(&cfg, model.fingerprint(), 1).unwrap();
+        // Append beyond max_seq_len
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim();
+        let dummy = vec![0.0f32; kv_dim];
+        let res = cache.append_step(0, &dummy, &dummy, cfg.max_seq_len);
+        assert!(matches!(res, Err(CacheError::CapacityExceeded { .. })));
     }
 }

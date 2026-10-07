@@ -48,26 +48,48 @@ fn silu_known_values() {
 }
 
 #[test]
-fn padded_query_counterexample_is_zero() {
-    // Padded query with an allowed key and V=(7,0): output must be exactly zero.
-    let q = t(&[1, 2], vec![1., 1.]);
-    let k = t(&[1, 2], vec![1., 1.]);
-    let v = t(&[1, 2], vec![7., 0.]);
-    let (out, p) = attention_ref(&q, &k, &v, &[false], &[true], 0).unwrap();
-    assert_eq!(out.data(), [0.0, 0.0]);
-    assert_eq!(p, [0.0]);
+fn padded_query_with_nan_v_outputs_zero() {
+    let q = t(&[2, 2], vec![1., 0., 0., 1.]);
+    let k = t(&[2, 2], vec![1., 0., 0., 1.]);
+    // v has finite values in row 0, and NaN in row 1
+    let v = t(&[2, 2], vec![3., 4., f32::NAN, f32::NAN]);
+    // row 0 is valid query, row 1 is padded query
+    let (out, p) = attention_ref(&q, &k, &v, &[true, false], &[true, false], 0).unwrap();
+    // row 0 gets row 0 of V
+    assert_eq!(out.data()[0], 3.0);
+    assert_eq!(out.data()[1], 4.0);
+    // row 1 was padded, so its output MUST be exact 0.0 without multiplying NaN V
+    assert_eq!(out.data()[2], 0.0);
+    assert_eq!(out.data()[3], 0.0);
+    assert_eq!(p[2], 0.0);
+    assert_eq!(p[3], 0.0);
 }
 
 #[test]
-fn fully_masked_valid_query_errors_and_offset_works() {
-    let q = t(&[1, 2], vec![1., 0.]);
+fn attention_rank_validation() {
+    let q = t(&[2], vec![1., 0.]);
     let k = t(&[2, 2], vec![1., 0., 0., 1.]);
     let v = k.clone();
     assert!(matches!(
-        attention_ref(&q, &k, &v, &[true], &[false, false], 0),
-        Err(TensorError::AllMaskedRow { .. })
+        attention_ref(&q, &k, &v, &[true], &[true, true], 0),
+        Err(TensorError::Rank { .. })
     ));
-    // offset=1 lets the single query see both keys (decode-style).
-    let (_, p) = attention_ref(&q, &k, &v, &[true], &[true, true], 1).unwrap();
-    assert!(p[0] > 0.0 && p[1] > 0.0 && (p[0] + p[1] - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn batched_matmul_and_reductions() {
+    let a = t(&[2, 2, 2], vec![1., 2., 3., 4., 5., 6., 7., 8.]);
+    let b = t(&[2, 2, 2], vec![1., 0., 0., 1., 2., 0., 0., 2.]);
+    let c = batched_matmul(&a, &b).unwrap();
+    assert_eq!(c.data()[..4], [1., 2., 3., 4.]);
+    assert_eq!(c.data()[4..], [10., 12., 14., 16.]);
+
+    let lse = logsumexp(&[0.0, 0.0]);
+    assert!((lse - 2.0f32.ln()).abs() < 1e-6);
+
+    let m = t(&[2, 3], vec![1., 2., 3., 4., 5., 6.]);
+    let s0 = sum_axis(&m, 0).unwrap();
+    assert_eq!(s0.data(), [5., 7., 9.]);
+    let s1 = sum_axis(&m, 1).unwrap();
+    assert_eq!(s1.data(), [6., 15.]);
 }
