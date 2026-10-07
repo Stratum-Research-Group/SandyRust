@@ -107,6 +107,7 @@ cargo run --release -- eval flip --task kv_lookup --split test
 | **GX13** | `acceptance` | **Activation Hooks & Steering** | Zero-overhead Off mode; bitwise record/patch parity; bounded steering | **PASS** |
 | **GX14** | `acceptance` | **Paired Perturbation & Flip-Rate** | 4 synthetic task generators; 0% split leakage; exact hand-worked metrics; reproducible bootstrap | **PASS** |
 | **GX15** | `acceptance` | **FP32 LoRA (Parameter-Efficient)** | Zero-init bitwise match; analytic gradcheck; base immutability; weight merge equivalence | **PASS** |
+| **GX16** | `acceptance` | **Associative Fast-Weight Memory** | Zero-gate baseline match; read-before-update causality; chunk parity; session isolation | **PASS** |
 
 ## Unsupported Features & Non-Goals
 

@@ -10,6 +10,7 @@ pub mod eval;
 pub mod gates;
 pub mod generation;
 pub mod hooks;
+pub mod memory;
 pub mod model;
 pub mod optimizer;
 pub mod rng;

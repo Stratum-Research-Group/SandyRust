@@ -52,6 +52,7 @@ To prevent evidence inflation and distinguish superficial smoke tests from verif
 | **GX13** | `acceptance` | `PASS` | Activation hooks, inspectability & bounded steering (`Addendum A1 §A2`) | Bitwise match on disabled/record/zero/patch; export caps; cache intervention policy hash | `Config::reference_v2` | Training-time steering |
 | **GX14** | `acceptance` | `PASS` | Paired perturbation & semantic flip-rate evaluation (`Addendum A1 §A3`) | Deterministic generators, 0% split prompt leakage, hand-worked metrics parity, bootstrap reproducibility, trivial baselines | `Config::reference_v2` | Model training dependencies |
 | **GX15** | `acceptance` | `PASS` | FP32 Low-Rank Adaptation (LoRA) (`Addendum A1 §A5`) | Zero-init bitwise match, analytic gradcheck vs finite differences, base weight immutability, merge equivalence $W' = W + sBA$, header integrity & adapter compatibility | `Config::reference_v2` | Quantized LoRA, base weight training |
+| **GX16** | `acceptance` | `PASS` | Associative Fast-Weight Memory (`Addendum A1 §A6`) | Zero-gate ($g=0$) baseline bitwise match, read-before-update causality, chunked boundary parity, session isolation, snapshot rollback & checksum tamper detection, 100-chunk numerical stability | `Config::reference_v2` with `ext_x16_memory=true` | Persistent cross-session database, GPU acceleration |
 
 ---
 
