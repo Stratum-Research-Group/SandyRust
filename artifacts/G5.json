@@ -1,0 +1,18 @@
+{
+  "version": "3.0",
+  "gate_id": "G5",
+  "status": "PASS",
+  "reason": null,
+  "revision": "unversioned",
+  "fixture_hash": "n/a-analytic",
+  "config": "reference_v2",
+  "command": "cargo run -- verify",
+  "backend": "cpu_reference",
+  "device": "cpu",
+  "dtype": "fp32",
+  "expected": "RMSNorm equation; RoPE norm preserved",
+  "observed": "norm_ok=true rope_norm_ok=true",
+  "tolerance_atol": 0.00001,
+  "tolerance_rtol": 0.0001,
+  "execution_time_ms": 0
+}

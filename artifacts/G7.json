@@ -1,0 +1,18 @@
+{
+  "version": "3.0",
+  "gate_id": "G7",
+  "status": "PASS",
+  "reason": null,
+  "revision": "unversioned",
+  "fixture_hash": "n/a-analytic",
+  "config": "reference_v2",
+  "command": "cargo run -- verify",
+  "backend": "cpu_reference",
+  "device": "cpu",
+  "dtype": "fp32",
+  "expected": "incremental cached decode matches full forward within 1e-4",
+  "observed": "max_err=0",
+  "tolerance_atol": 0.00001,
+  "tolerance_rtol": 0.0001,
+  "execution_time_ms": 19
+}

@@ -1,0 +1,203 @@
+//! Hyperparameters, validation (specv3 §2.2, §3.6) and parameter inventory (§2.3).
+
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigError {
+    NonFinite(&'static str),
+    OutOfRange(&'static str),
+    Divisibility(&'static str),
+    SpecialTokens(&'static str),
+    ResourceCap(&'static str),
+    UnsupportedSchema(u32),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for ConfigError {}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Config {
+    pub schema_version: u32,
+    pub vocab_size: usize,
+    pub d_model: usize,
+    pub n_layers: usize,
+    pub n_q_heads: usize,
+    pub n_kv_heads: usize,
+    pub d_ff: usize,
+    pub max_seq_len: usize,
+    pub batch_size: usize,
+    pub rope_theta: f32,
+    pub rms_eps: f32,
+    pub bos_id: u32,
+    pub eos_id: u32,
+    pub pad_id: u32,
+    pub tied_embeddings: bool,
+    pub seed: u64,
+}
+
+pub const MAX_SEQ_CAP: usize = 8192;
+pub const MAX_BATCH_CAP: usize = 256;
+
+impl Config {
+    /// `reference_v2` baseline: MHA, tied, V=259, D=128, L=4, P=886,272.
+    pub fn reference_v2() -> Self {
+        Config {
+            schema_version: 1,
+            vocab_size: 259,
+            d_model: 128,
+            n_layers: 4,
+            n_q_heads: 4,
+            n_kv_heads: 4,
+            d_ff: 384,
+            max_seq_len: 64,
+            batch_size: 2,
+            rope_theta: 10000.0,
+            rms_eps: 1e-5,
+            bos_id: 256,
+            eos_id: 257,
+            pad_id: 258,
+            tied_embeddings: true,
+            seed: 0x5EED_5A9D,
+        }
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.d_model / self.n_q_heads
+    }
+
+    /// Validate every precondition of §3.6 before any allocation.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.schema_version != 1 {
+            return Err(ConfigError::UnsupportedSchema(self.schema_version));
+        }
+        if !(self.rms_eps.is_finite() && self.rms_eps > 0.0) {
+            return Err(ConfigError::NonFinite("rms_eps"));
+        }
+        if !(self.rope_theta.is_finite() && self.rope_theta > 1.0) {
+            return Err(ConfigError::NonFinite("rope_theta"));
+        }
+        for (v, name) in [
+            (self.d_model, "d_model"),
+            (self.n_q_heads, "n_q_heads"),
+            (self.n_kv_heads, "n_kv_heads"),
+            (self.n_layers, "n_layers"),
+            (self.d_ff, "d_ff"),
+        ] {
+            if v == 0 {
+                return Err(ConfigError::OutOfRange(name));
+            }
+        }
+        if self.d_model % self.n_q_heads != 0 {
+            return Err(ConfigError::Divisibility("d_model % n_q_heads"));
+        }
+        if self.n_q_heads % self.n_kv_heads != 0 {
+            return Err(ConfigError::Divisibility("n_q_heads % n_kv_heads"));
+        }
+        if self.head_dim() == 0 || self.head_dim() % 2 != 0 {
+            return Err(ConfigError::Divisibility("head_dim must be even"));
+        }
+        if self.vocab_size < 259 {
+            return Err(ConfigError::OutOfRange("vocab_size < 259"));
+        }
+        if self.max_seq_len < 1 {
+            return Err(ConfigError::OutOfRange("max_seq_len"));
+        }
+        let v = self.vocab_size as u64;
+        let ids = [self.bos_id, self.eos_id, self.pad_id];
+        if ids.iter().any(|&i| i < 256 || u64::from(i) >= v) {
+            return Err(ConfigError::SpecialTokens("special id must be in 256..vocab_size"));
+        }
+        if ids[0] == ids[1] || ids[1] == ids[2] || ids[0] == ids[2] {
+            return Err(ConfigError::SpecialTokens("special ids must be pairwise distinct"));
+        }
+        if self.max_seq_len > MAX_SEQ_CAP {
+            return Err(ConfigError::ResourceCap("max_seq_len"));
+        }
+        if self.batch_size > MAX_BATCH_CAP {
+            return Err(ConfigError::ResourceCap("batch_size"));
+        }
+        Ok(())
+    }
+
+    /// Exact parameter count per §2.3 (checked arithmetic, no biases).
+    pub fn param_count(&self) -> Option<usize> {
+        let d = self.d_model;
+        let dh = self.head_dim();
+        let kv = self.n_kv_heads.checked_mul(dh)?;
+        let q = self.n_q_heads.checked_mul(dh)?;
+        let per_layer = d // rms1
+            .checked_add(d.checked_mul(q)?)? // Wq
+            .checked_add(d.checked_mul(kv)?)? // Wk
+            .checked_add(d.checked_mul(kv)?)? // Wv
+            .checked_add(q.checked_mul(d)?)? // Wo
+            .checked_add(d)? // rms2
+            .checked_add(d.checked_mul(self.d_ff)?.checked_mul(3)?)?; // gate+up+down
+        let embed = self.vocab_size.checked_mul(d)?;
+        let mut total = embed
+            .checked_add(per_layer.checked_mul(self.n_layers)?)?
+            .checked_add(d)?; // final rms
+        if !self.tied_embeddings {
+            total = total.checked_add(embed)?;
+        }
+        Some(total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn baseline_param_count_g6() {
+        let c = Config::reference_v2();
+        c.validate().unwrap();
+        assert_eq!(c.param_count(), Some(886_272));
+    }
+
+    #[test]
+    fn untied_gqa_mqa_counts() {
+        let mut c = Config::reference_v2();
+        c.tied_embeddings = false;
+        assert_eq!(c.param_count(), Some(919_424));
+        c.n_kv_heads = 2;
+        assert_eq!(c.param_count(), Some(853_888));
+        c.tied_embeddings = true;
+        assert_eq!(c.param_count(), Some(820_736));
+        c.n_kv_heads = 1;
+        assert_eq!(c.param_count(), Some(787_968));
+        c.tied_embeddings = false;
+        assert_eq!(c.param_count(), Some(821_120));
+    }
+
+    #[test]
+    fn rejects_bad_configs() {
+        let mut c = Config::reference_v2();
+        c.rms_eps = f32::INFINITY;
+        assert!(c.validate().is_err());
+        let mut c = Config::reference_v2();
+        c.rms_eps = f32::NAN;
+        assert!(c.validate().is_err());
+        let mut c = Config::reference_v2();
+        c.n_q_heads = 3;
+        assert!(c.validate().is_err());
+        let mut c = Config::reference_v2();
+        c.pad_id = c.eos_id;
+        assert!(c.validate().is_err());
+        let mut c = Config::reference_v2();
+        c.bos_id = 5; // collides with byte token 5
+        assert!(c.validate().is_err());
+        let mut c = Config::reference_v2();
+        c.bos_id = c.pad_id;
+        assert!(c.validate().is_err());
+        let mut c = Config::reference_v2();
+        c.max_seq_len = MAX_SEQ_CAP + 1;
+        assert!(c.validate().is_err());
+        let mut c = Config::reference_v2();
+        c.schema_version = 2;
+        assert!(c.validate().is_err());
+    }
+}

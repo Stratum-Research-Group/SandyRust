@@ -1,0 +1,6 @@
+/target/
+**/*.rs.bk
+*.tmp
+*.ckpt
+*.txt
+specv3.md

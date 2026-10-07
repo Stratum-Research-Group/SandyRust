@@ -1,0 +1,12 @@
+[package]
+name = "sandy_rust"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone pure-Rust decoder-only transformer (specv3.md reference_v2 baseline)"
+license = "MIT OR Apache-2.0"
+
+# D2-R1: zero third-party dependencies in Phase 1 (no build.rs, no C/C++/CUDA).
+[dependencies]
+
+[profile.release]
+opt-level = 3

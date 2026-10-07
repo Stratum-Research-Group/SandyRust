@@ -1,0 +1,18 @@
+{
+  "version": "3.0",
+  "gate_id": "G11",
+  "status": "PASS",
+  "reason": null,
+  "revision": "unversioned",
+  "fixture_hash": "n/a-analytic",
+  "config": "reference_v2",
+  "command": "cargo run -- verify",
+  "backend": "cpu_reference",
+  "device": "cpu",
+  "dtype": "fp32",
+  "expected": "256-byte + UTF-8 roundtrip; y_t = x_{t+1}",
+  "observed": "bytes=true utf8=true shift=true",
+  "tolerance_atol": 0,
+  "tolerance_rtol": 0,
+  "execution_time_ms": 0
+}

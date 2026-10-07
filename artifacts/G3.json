@@ -1,0 +1,18 @@
+{
+  "version": "3.0",
+  "gate_id": "G3",
+  "status": "PASS",
+  "reason": null,
+  "revision": "unversioned",
+  "fixture_hash": "n/a-analytic",
+  "config": "reference_v2",
+  "command": "cargo run -- verify",
+  "backend": "cpu_reference",
+  "device": "cpu",
+  "dtype": "fp32",
+  "expected": "finite-difference matches analytic with 0 failures",
+  "observed": "Ok(GradCheckReport { checked: 114, failures: 0, max_abs_err: 8.861826450608234e-9, max_rel_err: 0.000335283947141383 })",
+  "tolerance_atol": 0.000001,
+  "tolerance_rtol": 0.0001,
+  "execution_time_ms": 1310
+}

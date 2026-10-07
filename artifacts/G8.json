@@ -1,0 +1,18 @@
+{
+  "version": "3.0",
+  "gate_id": "G8",
+  "status": "PASS",
+  "reason": null,
+  "revision": "unversioned",
+  "fixture_hash": "n/a-analytic",
+  "config": "reference_v2",
+  "command": "cargo run -- verify",
+  "backend": "cpu_reference",
+  "device": "cpu",
+  "dtype": "fp32",
+  "expected": "microbatch accumulation with AdamW update produces finite parameters",
+  "observed": "step=1, finite=true",
+  "tolerance_atol": 0.00001,
+  "tolerance_rtol": 0.0001,
+  "execution_time_ms": 37
+}
