@@ -74,8 +74,8 @@ pub fn rms_norm(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor, TensorEr
         let row = &x.data()[r * d..(r + 1) * d];
         let ms = row.iter().map(|v| v * v).sum::<f32>() / d as f32;
         let inv = 1.0 / (ms + eps).sqrt();
-        for i in 0..d {
-            out.data_mut()[r * d + i] = row[i] * inv * gamma.data()[i];
+        for (i, &val) in row.iter().enumerate().take(d) {
+            out.data_mut()[r * d + i] = val * inv * gamma.data()[i];
         }
     }
     Ok(out)
@@ -155,17 +155,17 @@ pub fn sum_axis(t: &Tensor, axis: usize) -> Result<Tensor, TensorError> {
         0 => {
             let mut out = vec![0.0f32; cols];
             for r in 0..rows {
-                for c in 0..cols {
-                    out[c] += t.data()[r * cols + c];
+                for (c, slot) in out.iter_mut().enumerate().take(cols) {
+                    *slot += t.data()[r * cols + c];
                 }
             }
             Tensor::from_vec(&[cols], out)
         }
         1 => {
             let mut out = vec![0.0f32; rows];
-            for r in 0..rows {
+            for (r, slot) in out.iter_mut().enumerate().take(rows) {
                 for c in 0..cols {
-                    out[r] += t.data()[r * cols + c];
+                    *slot += t.data()[r * cols + c];
                 }
             }
             Tensor::from_vec(&[rows], out)

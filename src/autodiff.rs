@@ -320,7 +320,7 @@ pub fn loss_and_grad<T: Float>(
                     }
                     let s = s * scale;
                     row[j] = s;
-                    if mx.map_or(true, |m| s > m) {
+                    if mx.is_none_or(|m| s > m) {
                         mx = Some(s);
                     }
                 }

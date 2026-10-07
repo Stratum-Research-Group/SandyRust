@@ -75,7 +75,7 @@ pub fn sample_next(logits: &[f32], p: &SamplingParams, rng: &mut Rng, position: 
             if disallowed(i) {
                 continue;
             }
-            if best.map_or(true, |b| z > logits[b]) {
+            if best.is_none_or(|b| z > logits[b]) {
                 best = Some(i);
             }
         }

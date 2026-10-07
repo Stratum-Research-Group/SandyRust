@@ -46,16 +46,16 @@ pub fn attention_ref(
     }
 
     // Check finite inputs on valid positions
-    for i in 0..tq {
-        if q_valid[i] {
+    for (i, &valid) in q_valid.iter().enumerate().take(tq) {
+        if valid {
             let row = &q.data()[i * dh..(i + 1) * dh];
             if row.iter().any(|x| !x.is_finite()) {
                 return Err(TensorError::InvalidArgument("non-finite query values"));
             }
         }
     }
-    for j in 0..tk {
-        if k_valid[j] {
+    for (j, &valid) in k_valid.iter().enumerate().take(tk) {
+        if valid {
             let row_k = &k.data()[j * dh..(j + 1) * dh];
             if row_k.iter().any(|x| !x.is_finite()) {
                 return Err(TensorError::InvalidArgument("non-finite key values"));
@@ -78,17 +78,17 @@ pub fn attention_ref(
         }
         let q_row = &q.data()[i * dh..(i + 1) * dh];
         let mut scores = vec![0.0f32; tk];
-        for j in 0..tk {
+        for (j, score) in scores.iter_mut().enumerate().take(tk) {
             let k_row = &k.data()[j * dh..(j + 1) * dh];
             let mut dot = 0.0f32;
             for d in 0..dh {
                 dot += q_row[d] * k_row[d];
             }
-            scores[j] = dot * scale;
+            *score = dot * scale;
         }
 
         let vis: Vec<bool> = (0..tk)
-            .map(|j| k_valid[j] && j <= i.checked_add(offset).unwrap_or(usize::MAX))
+            .map(|j| k_valid[j] && j <= i.saturating_add(offset))
             .collect();
         if !masked_softmax_row(&mut scores, &vis) {
             return Err(TensorError::AllMaskedRow { row: i });
@@ -97,8 +97,7 @@ pub fn attention_ref(
 
         // Compute output for valid query row i: sum_j (probs[i, j] * v[j, :])
         let out_row = &mut out.data_mut()[i * dv..(i + 1) * dv];
-        for j in 0..tk {
-            let p_val = scores[j];
+        for (j, &p_val) in scores.iter().enumerate().take(tk) {
             if p_val > 0.0 {
                 let v_row = &v.data()[j * dv..(j + 1) * dv];
                 for d in 0..dv {

@@ -59,8 +59,8 @@ impl Rng {
             qr(&mut w, 2, 7, 8, 13);
             qr(&mut w, 3, 4, 9, 14);
         }
-        for i in 0..16 {
-            self.buf[i] = w[i].wrapping_add(self.state[i]);
+        for ((slot, &w_elem), &st_elem) in self.buf.iter_mut().zip(&w).zip(&self.state) {
+            *slot = w_elem.wrapping_add(st_elem);
         }
         // 64-bit block counter in words 12..14
         let (lo, carry) = self.state[12].overflowing_add(1);

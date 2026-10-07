@@ -84,6 +84,7 @@ impl GateReport {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report(
     gate_id: &'static str,
     scope: &'static str,
@@ -202,7 +203,7 @@ pub fn g3() -> GateReport {
     let window = [256u32, 65, 66, 65, 257];
     let eps_list = [1e-5, 1e-6, 1e-7];
     let rep = crate::autodiff::gradcheck(&cfg, &p_f64, &window, &eps_list, 1e-5, 1e-3, 1);
-    let ok = rep.as_ref().map_or(false, |r| r.failures == 0);
+    let ok = rep.as_ref().is_ok_and(|r| r.failures == 0);
     report(
         "G3",
         "acceptance",
@@ -469,7 +470,7 @@ pub fn g10() -> GateReport {
     let toks = [256u32, 82, 117, 115, 116];
     let bytes = checkpoint::serialize(&m);
     let reload = checkpoint::parse(&bytes, &m.cfg, DEFAULT_MAX_BYTES);
-    let bitwise = reload.as_ref().map_or(false, |m2| m.forward(&toks, None).unwrap() == m2.forward(&toks, None).unwrap());
+    let bitwise = reload.as_ref().is_ok_and(|m2| m.forward(&toks, None).unwrap() == m2.forward(&toks, None).unwrap());
     let mut bad = bytes.clone();
     let last = bad.len() - 1;
     bad[last] ^= 0xFF;
@@ -572,7 +573,7 @@ pub fn g12() -> GateReport {
     let full_fwd = m.forward(&full_seq, None).unwrap();
     let v = m.cfg.vocab_size;
     let term_pos = full_seq.len() - 1;
-    let terminal_parity = gen_out.terminal_pos == term_pos && gen_out.final_logits == &full_fwd.data()[term_pos * v..(term_pos + 1) * v];
+    let terminal_parity = gen_out.terminal_pos == term_pos && gen_out.final_logits == full_fwd.data()[term_pos * v..(term_pos + 1) * v];
 
     // UTF-8 stream buffer check across token splits
     let mut buf = Utf8ByteStreamBuffer::new();
