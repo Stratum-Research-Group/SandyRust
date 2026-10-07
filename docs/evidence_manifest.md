@@ -48,6 +48,7 @@ To prevent evidence inflation and distinguish superficial smoke tests from verif
 | **G12** | `acceptance` | `PASS` | Deterministic sampling, terminal logit parity, UTF-8 streaming (`§8.3`) | Greedy ignores PRNG; seeded sampling repeats; terminal logits match full forward; UTF-8 buffer | Sampler, UTF-8 buffer | Lossy whole-buffer only decoding |
 | **G13** | `acceptance` | `NOT_RUN` | GPU reference kernel acceleration spike (`§9 G13`) | None (CPU pure-Rust baseline selected under Decision D2-R1) | GPU / CUDA hardware | Decision D2-R1 boundary |
 | **G14** | `regression` | `PASS` | Resource caps, bounded allocation, and typed error safety (`§2.2`, `§8.2`) | Oversize checkpoint rejected; context overflow rejected; rank error rejected; all-PAD rejected | Resource accounting | Unbounded buffer growth |
+| **GX13** | `acceptance` | `PASS` | Activation hooks, inspectability & bounded steering (`Addendum A1 §A2`) | Bitwise match on disabled/record/zero/patch; export caps; cache intervention policy hash | `Config::reference_v2` | Training-time steering |
 
 ---
 

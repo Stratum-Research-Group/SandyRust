@@ -22,5 +22,5 @@
   "observed": "initial=5.6397, final=0.0006",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 718
+  "execution_time_ms": 746
 }

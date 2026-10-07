@@ -65,6 +65,16 @@ Generate tokens using greedy or stochastic sampling:
 cargo run --release -- generate --prompt "Hello world" --max-tokens 32 --temperature 0.8 --top-k 20 --top-p 0.9
 ```
 
+### 6. Activation Inspection & Steering (X13)
+Record activation tensors or steer representations with zero-overhead off branch:
+```bash
+# Record activations to a bounded memory sink
+cargo run --release -- inspect --prompt "Hello world" --mode record
+
+# Apply bounded residual steering at inference
+cargo run --release -- inspect --prompt "Hello world" --mode steer --alpha 2.0
+```
+
 ## Quality Acceptance Gates
 
 | Gate | Scope | Title | Description | Status |
@@ -83,6 +93,7 @@ cargo run --release -- generate --prompt "Hello world" --max-tokens 32 --tempera
 | **G12** | `acceptance` | **Sampling Determinism** | Seeded sampling reproduces tokens; terminal logit parity; UTF-8 stream buffer | **PASS** |
 | **G13** | `acceptance` | **GPU Spike** | Optional GPU spike deferred under CPU baseline | **NOT RUN** (D2-R1) |
 | **G14** | `regression` | **Failure Mode Handling** | Oversized checkpoints, capacity overflows, and rank errors rejected safely | **PASS** |
+| **GX13** | `acceptance` | **Activation Hooks & Steering** | Zero-overhead Off mode; bitwise record/patch parity; bounded steering | **PASS** |
 
 ## Unsupported Features & Non-Goals
 

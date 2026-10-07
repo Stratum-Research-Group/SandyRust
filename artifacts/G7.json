@@ -22,5 +22,5 @@
   "observed": "componentwise=true stale_rejected=true",
   "tolerance_atol": 0.00001,
   "tolerance_rtol": 0.0001,
-  "execution_time_ms": 119
+  "execution_time_ms": 113
 }

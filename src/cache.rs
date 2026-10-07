@@ -10,6 +10,7 @@ use crate::tensor::{Tensor, TensorError};
 pub enum CacheError {
     CapacityExceeded { current: usize, requested: usize, max: usize },
     BindingMismatch(&'static str),
+    InterventionMismatch { expected: [u8; 32], actual: [u8; 32] },
     LayerOutOfBounds { layer: usize, total: usize },
     PositionMismatch { expected: usize, actual: usize },
     Tensor(TensorError),
@@ -34,6 +35,7 @@ impl From<CacheError> for ModelError {
 pub struct KVCache {
     pub model_fingerprint: [u8; 32],
     pub config_fingerprint: [u8; 32],
+    pub intervention_policy_hash: [u8; 32],
     pub session_id: u64,
     pub max_seq_len: usize,
     pub seq_len: usize,
@@ -60,12 +62,18 @@ impl KVCache {
         Ok(KVCache {
             model_fingerprint,
             config_fingerprint: cfg.fingerprint(),
+            intervention_policy_hash: [0u8; 32],
             session_id,
             max_seq_len: max_seq,
             seq_len: 0,
             k,
             v,
         })
+    }
+
+    pub fn with_intervention_policy_hash(mut self, hash: [u8; 32]) -> Self {
+        self.intervention_policy_hash = hash;
+        self
     }
 
     pub fn check_capacity(&self, additional: usize) -> Result<(), CacheError> {
@@ -127,12 +135,31 @@ fn slice_cols(t: &Tensor, start: usize, len: usize) -> Result<Tensor, TensorErro
 /// Execute a single incremental decoding step using the contiguous KV cache.
 /// Enforces model identity, transactional rollback on mid-step failure, and exact forward equivalence.
 pub fn forward_step(model: &Model, token: u32, pos: usize, cache: &mut KVCache) -> Result<Tensor, ModelError> {
+    forward_step_with_hooks(model, token, pos, cache, None, None)
+}
+
+/// Execute a single incremental decoding step with optional hook context and intervention policy enforcement.
+pub fn forward_step_with_hooks(
+    model: &Model,
+    token: u32,
+    pos: usize,
+    cache: &mut KVCache,
+    ctx: Option<&crate::hooks::HookContext>,
+    mut sink: Option<&mut crate::hooks::ActivationSink>,
+) -> Result<Tensor, ModelError> {
     let c = &model.cfg;
     if cache.model_fingerprint != model.fingerprint() {
         return Err(CacheError::BindingMismatch("model fingerprint mismatch").into());
     }
     if cache.config_fingerprint != c.fingerprint() {
         return Err(CacheError::BindingMismatch("config fingerprint mismatch").into());
+    }
+    let active_policy_hash = ctx.map_or(crate::hooks::EMPTY_POLICY_HASH, |c| c.intervention_policy_hash());
+    if cache.intervention_policy_hash != active_policy_hash {
+        return Err(CacheError::InterventionMismatch {
+            expected: active_policy_hash,
+            actual: cache.intervention_policy_hash,
+        }.into());
     }
     if pos >= c.max_seq_len || pos >= cache.max_seq_len {
         return Err(ModelError::SequenceTooLong { len: pos + 1, max: c.max_seq_len });
@@ -145,10 +172,29 @@ pub fn forward_step(model: &Model, token: u32, pos: usize, cache: &mut KVCache) 
         return Err(ModelError::TokenOutOfRange { token, vocab: c.vocab_size });
     }
 
+    if let Some(hook_ctx) = ctx {
+        hook_ctx.validate(model)?;
+    }
+
     let mut staged_k = Vec::with_capacity(c.n_layers);
     let mut staged_v = Vec::with_capacity(c.n_layers);
 
     let mut x = model.embed.gather_rows(&[token as usize])?;
+
+    // Site 1: EmbedOut
+    if let Some(hook_ctx) = ctx {
+        let hook = crate::hooks::HookId::global(crate::hooks::HookSite::EmbedOut);
+        if let Some(ref mut s) = sink {
+            crate::hooks::apply_records(&hook, &x, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+        }
+        if !hook_ctx.edits.is_empty() {
+            crate::hooks::apply_edits(&hook, &mut x, &hook_ctx.edits, pos, 1)?;
+        }
+        if let Some(ref mut s) = sink {
+            crate::hooks::apply_records(&hook, &x, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+        }
+    }
+
     let (dh, group) = (c.head_dim(), c.n_q_heads / c.n_kv_heads);
     let kv_dim = c.n_kv_heads * dh;
     let k_len = pos + 1;
@@ -156,7 +202,38 @@ pub fn forward_step(model: &Model, token: u32, pos: usize, cache: &mut KVCache) 
     let k_valid = vec![true; k_len];
 
     for (l_idx, l) in model.layers.iter().enumerate() {
-        let r = rms_norm(&x, &l.rms1, c.rms_eps)?;
+        let layer_u16 = l_idx as u16;
+
+        // Site 2: ResidPre
+        if let Some(hook_ctx) = ctx {
+            let hook = crate::hooks::HookId::layer(layer_u16, crate::hooks::HookSite::ResidPre);
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &x, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+            }
+            if !hook_ctx.edits.is_empty() {
+                crate::hooks::apply_edits(&hook, &mut x, &hook_ctx.edits, pos, 1)?;
+            }
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &x, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+            }
+        }
+
+        let mut r = rms_norm(&x, &l.rms1, c.rms_eps)?;
+
+        // Site 3: AttnNormOut
+        if let Some(hook_ctx) = ctx {
+            let hook = crate::hooks::HookId::layer(layer_u16, crate::hooks::HookSite::AttnNormOut);
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &r, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+            }
+            if !hook_ctx.edits.is_empty() {
+                crate::hooks::apply_edits(&hook, &mut r, &hook_ctx.edits, pos, 1)?;
+            }
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &r, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+            }
+        }
+
         let q = matmul(&r, &l.wq)?;
         let k = matmul(&r, &l.wk)?;
         let v = matmul(&r, &l.wv)?;
@@ -189,21 +266,171 @@ pub fn forward_step(model: &Model, token: u32, pos: usize, cache: &mut KVCache) 
         let mut merged = Tensor::zeros(&[1, c.n_q_heads * dh])?;
         for h in 0..c.n_q_heads {
             let kvh = h / group;
-            let qh = rope(&slice_cols(&q, h * dh, dh)?, c.rope_theta, pos)?;
+            let mut qh = rope(&slice_cols(&q, h * dh, dh)?, c.rope_theta, pos)?;
+
+            // Site 4a: Q
+            if let Some(hook_ctx) = ctx {
+                let hook = crate::hooks::HookId::head(layer_u16, crate::hooks::HookSite::Q, h as u16);
+                if let Some(ref mut s) = sink {
+                    crate::hooks::apply_records(&hook, &qh, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+                }
+                if !hook_ctx.edits.is_empty() {
+                    crate::hooks::apply_edits(&hook, &mut qh, &hook_ctx.edits, pos, 1)?;
+                }
+                if let Some(ref mut s) = sink {
+                    crate::hooks::apply_records(&hook, &qh, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+                }
+            }
+
             let kh = slice_cols(&current_k_tensor, kvh * dh, dh)?;
             let vh = slice_cols(&current_v_tensor, kvh * dh, dh)?;
-            let (o, _) = attention_ref(&qh, &kh, &vh, &q_valid, &k_valid, pos)?;
+            let (mut o, _) = attention_ref(&qh, &kh, &vh, &q_valid, &k_valid, pos)?;
+
+            // Site 7: HeadOut
+            if let Some(hook_ctx) = ctx {
+                let hook = crate::hooks::HookId::head(layer_u16, crate::hooks::HookSite::HeadOut, h as u16);
+                if let Some(ref mut s) = sink {
+                    crate::hooks::apply_records(&hook, &o, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+                }
+                if !hook_ctx.edits.is_empty() {
+                    crate::hooks::apply_edits(&hook, &mut o, &hook_ctx.edits, pos, 1)?;
+                }
+                if let Some(ref mut s) = sink {
+                    crate::hooks::apply_records(&hook, &o, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+                }
+            }
+
             merged.data_mut()[h * dh..(h + 1) * dh].copy_from_slice(o.data());
         }
 
-        x = add(&x, &matmul(&merged, &l.wo)?)?;
-        let r2 = rms_norm(&x, &l.rms2, c.rms_eps)?;
-        let hidden = mul(&silu(&matmul(&r2, &l.w_gate)?), &matmul(&r2, &l.w_up)?)?;
-        x = add(&x, &matmul(&hidden, &l.w_down)?)?;
+        let mut attn_out = matmul(&merged, &l.wo)?;
+
+        // Site 8: AttnOut
+        if let Some(hook_ctx) = ctx {
+            let hook = crate::hooks::HookId::layer(layer_u16, crate::hooks::HookSite::AttnOut);
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &attn_out, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+            }
+            if !hook_ctx.edits.is_empty() {
+                crate::hooks::apply_edits(&hook, &mut attn_out, &hook_ctx.edits, pos, 1)?;
+            }
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &attn_out, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+            }
+        }
+
+        x = add(&x, &attn_out)?;
+
+        // Site 9: ResidMid
+        if let Some(hook_ctx) = ctx {
+            let hook = crate::hooks::HookId::layer(layer_u16, crate::hooks::HookSite::ResidMid);
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &x, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+            }
+            if !hook_ctx.edits.is_empty() {
+                crate::hooks::apply_edits(&hook, &mut x, &hook_ctx.edits, pos, 1)?;
+            }
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &x, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+            }
+        }
+
+        let mut r2 = rms_norm(&x, &l.rms2, c.rms_eps)?;
+
+        // Site 10a: MlpNormOut
+        if let Some(hook_ctx) = ctx {
+            let hook = crate::hooks::HookId::layer(layer_u16, crate::hooks::HookSite::MlpNormOut);
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &r2, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+            }
+            if !hook_ctx.edits.is_empty() {
+                crate::hooks::apply_edits(&hook, &mut r2, &hook_ctx.edits, pos, 1)?;
+            }
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &r2, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+            }
+        }
+
+        let mut hidden = mul(&silu(&matmul(&r2, &l.w_gate)?), &matmul(&r2, &l.w_up)?)?;
+
+        // Site 10b: MlpHidden
+        if let Some(hook_ctx) = ctx {
+            let hook = crate::hooks::HookId::layer(layer_u16, crate::hooks::HookSite::MlpHidden);
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &hidden, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+            }
+            if !hook_ctx.edits.is_empty() {
+                crate::hooks::apply_edits(&hook, &mut hidden, &hook_ctx.edits, pos, 1)?;
+            }
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &hidden, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+            }
+        }
+
+        let mut mlp_out = matmul(&hidden, &l.w_down)?;
+
+        // Site 10c: MlpOut
+        if let Some(hook_ctx) = ctx {
+            let hook = crate::hooks::HookId::layer(layer_u16, crate::hooks::HookSite::MlpOut);
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &mlp_out, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+            }
+            if !hook_ctx.edits.is_empty() {
+                crate::hooks::apply_edits(&hook, &mut mlp_out, &hook_ctx.edits, pos, 1)?;
+            }
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &mlp_out, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+            }
+        }
+
+        x = add(&x, &mlp_out)?;
+
+        // Site 11: ResidPost
+        if let Some(hook_ctx) = ctx {
+            let hook = crate::hooks::HookId::layer(layer_u16, crate::hooks::HookSite::ResidPost);
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &x, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+            }
+            if !hook_ctx.edits.is_empty() {
+                crate::hooks::apply_edits(&hook, &mut x, &hook_ctx.edits, pos, 1)?;
+            }
+            if let Some(ref mut s) = sink {
+                crate::hooks::apply_records(&hook, &x, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+            }
+        }
     }
 
-    let x = rms_norm(&x, &model.final_norm, c.rms_eps)?;
-    let logits = matmul(&x, &model.embed.transpose2d()?)?;
+    let mut final_x = rms_norm(&x, &model.final_norm, c.rms_eps)?;
+
+    // Site 12a: FinalNormOut
+    if let Some(hook_ctx) = ctx {
+        let hook = crate::hooks::HookId::global(crate::hooks::HookSite::FinalNormOut);
+        if let Some(ref mut s) = sink {
+            crate::hooks::apply_records(&hook, &final_x, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+        }
+        if !hook_ctx.edits.is_empty() {
+            crate::hooks::apply_edits(&hook, &mut final_x, &hook_ctx.edits, pos, 1)?;
+        }
+        if let Some(ref mut s) = sink {
+            crate::hooks::apply_records(&hook, &final_x, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+        }
+    }
+
+    let mut logits = matmul(&final_x, &model.embed.transpose2d()?)?;
+
+    // Site 12b: Logits
+    if let Some(hook_ctx) = ctx {
+        let hook = crate::hooks::HookId::global(crate::hooks::HookSite::Logits);
+        if let Some(ref mut s) = sink {
+            crate::hooks::apply_records(&hook, &logits, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+        }
+        if !hook_ctx.edits.is_empty() {
+            crate::hooks::apply_edits(&hook, &mut logits, &hook_ctx.edits, pos, 1)?;
+        }
+        if let Some(ref mut s) = sink {
+            crate::hooks::apply_records(&hook, &logits, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+        }
+    }
 
     // Commit only after complete step succeeds
     for l_idx in 0..c.n_layers {

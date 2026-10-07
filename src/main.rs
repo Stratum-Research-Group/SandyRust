@@ -236,6 +236,43 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some("inspect") => {
+            let prompt = flag(&args, "--prompt").unwrap_or("Hello");
+            let mode = flag(&args, "--mode").unwrap_or("record");
+            let tok = ByteTokenizer::new();
+            let mut prompt_tokens = vec![BOS];
+            prompt_tokens.extend(tok.encode_bytes(prompt.as_bytes()));
+            let m = Model::init(&cfg).expect("model init");
+            match mode {
+                "record" => {
+                    let mut sink = sandy_rust::hooks::ActivationSink::new(sandy_rust::hooks::DEFAULT_MAX_EXPORT_BYTES).unwrap();
+                    let ctx = sandy_rust::hooks::HookContext::new().with_record(
+                        sandy_rust::hooks::HookId::global(sandy_rust::hooks::HookSite::EmbedOut),
+                        sandy_rust::hooks::RecordTiming::PostEdit,
+                    );
+                    let out = m.forward_with_hooks(&prompt_tokens, None, Some(&ctx), Some(&mut sink)).expect("forward");
+                    println!("Recorded {} activation tensors; logits shape: {:?}", sink.records.len(), out.shape());
+                }
+                "steer" => {
+                    let alpha = parse_flag(&args, "--alpha", 1.0f32).unwrap_or(1.0);
+                    let steer_op = sandy_rust::hooks::EditOp::Steer {
+                        hook: sandy_rust::hooks::HookId::layer(0, sandy_rust::hooks::HookSite::ResidPre),
+                        direction: vec![0.1f32; 128],
+                        alpha,
+                        positions: sandy_rust::hooks::SteerPosition::AllPositions,
+                        direction_id: "cli_steer".to_string(),
+                    };
+                    let ctx = sandy_rust::hooks::HookContext::new().with_edit(steer_op);
+                    let out = m.forward_with_hooks(&prompt_tokens, None, Some(&ctx), None).expect("forward");
+                    println!("Steered forward complete with alpha={alpha}; logits shape: {:?}", out.shape());
+                }
+                other => {
+                    eprintln!("unknown inspect mode: '{other}' (expected 'record' or 'steer')");
+                    return ExitCode::from(2);
+                }
+            }
+            ExitCode::SUCCESS
+        }
         _ => {
             eprintln!("usage: sandy_rust <command> [options]");
             eprintln!("commands:");
@@ -244,6 +281,7 @@ fn main() -> ExitCode {
             eprintln!("  gradcheck");
             eprintln!("  checkpoint  --init <path> | --inspect <path>");
             eprintln!("  generate    [--prompt s] [--max-tokens n] [--temperature t] [--top-k k] [--top-p p] [--seed n] [--checkpoint path]");
+            eprintln!("  inspect     [--prompt s] [--mode record|steer] [--alpha f]");
             ExitCode::from(2)
         }
     }

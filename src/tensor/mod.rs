@@ -58,6 +58,13 @@ impl Tensor {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+    pub fn to_le_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.data.len() * 4);
+        for &x in &self.data {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        bytes
+    }
 
     pub fn reshape(&self, shape: &[usize]) -> Result<Tensor, TensorError> {
         if numel(shape)? != self.data.len() {

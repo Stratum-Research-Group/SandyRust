@@ -16,6 +16,7 @@ pub enum GenerationError {
     EmptyFilteredDistribution,
     SessionMismatch { expected: u64, actual: u64 },
     ModelCheckpointMismatch,
+    CacheInterventionMismatch { expected: [u8; 32], actual: [u8; 32] },
     Forward(String),
 }
 

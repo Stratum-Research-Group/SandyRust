@@ -22,5 +22,5 @@
   "observed": "bitwise=true corrupt_rej=true trunc_rej=true trn_ok=true",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 144
+  "execution_time_ms": 158
 }

@@ -38,6 +38,8 @@ pub struct Config {
     pub pad_id: u32,
     pub tied_embeddings: bool,
     pub seed: u64,
+    pub ext_x13_hooks: bool,
+    pub ext_x13_edit: bool,
 }
 
 pub const MAX_SEQ_CAP: usize = 8192;
@@ -67,6 +69,8 @@ impl Config {
             pad_id: 258,
             tied_embeddings: true,
             seed: 0x5EED_5A9D,
+            ext_x13_hooks: false,
+            ext_x13_edit: false,
         }
     }
 
@@ -76,13 +80,24 @@ impl Config {
 
     /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
     pub fn fingerprint(&self) -> [u8; 32] {
-        let s = format!(
-            "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th{:.6}:eps{:.8}:bos{}:eos{}:pad{}:tied{}:seed{}",
-            self.schema_version, self.vocab_size, self.d_model, self.n_layers,
-            self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
-            self.batch_size, self.rope_theta, self.rms_eps,
-            self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed
-        );
+        let s = if !self.ext_x13_hooks && !self.ext_x13_edit {
+            format!(
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th{:.6}:eps{:.8}:bos{}:eos{}:pad{}:tied{}:seed{}",
+                self.schema_version, self.vocab_size, self.d_model, self.n_layers,
+                self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
+                self.batch_size, self.rope_theta, self.rms_eps,
+                self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed
+            )
+        } else {
+            format!(
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th{:.6}:eps{:.8}:bos{}:eos{}:pad{}:tied{}:seed{}:x13h{}:x13e{}",
+                self.schema_version, self.vocab_size, self.d_model, self.n_layers,
+                self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
+                self.batch_size, self.rope_theta, self.rms_eps,
+                self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed,
+                self.ext_x13_hooks, self.ext_x13_edit
+            )
+        };
         crate::sha256::sha256(s.as_bytes())
     }
 

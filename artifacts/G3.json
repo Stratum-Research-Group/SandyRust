@@ -22,5 +22,5 @@
   "observed": "Ok(GradCheckReport { checked: 114, failures: 0, max_abs_err: 6.284789657445833e-9, max_rel_err: 0.0001926368949907955 })",
   "tolerance_atol": 0.00001,
   "tolerance_rtol": 0.001,
-  "execution_time_ms": 1513
+  "execution_time_ms": 1465
 }

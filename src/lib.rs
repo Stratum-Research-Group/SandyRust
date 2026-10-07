@@ -7,6 +7,7 @@ pub mod config;
 pub mod data;
 pub mod gates;
 pub mod generation;
+pub mod hooks;
 pub mod model;
 pub mod optimizer;
 pub mod rng;
