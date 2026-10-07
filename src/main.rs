@@ -8,16 +8,29 @@ use sandy_rust::optimizer::{AdamW, Schedule};
 use sandy_rust::tokenizer::{ByteTokenizer, BOS};
 use std::{env, fs, path::Path, process::ExitCode, str::FromStr};
 
-fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+fn flag<'a>(args: &'a [String], name: &str) -> Result<Option<&'a str>, String> {
+    if let Some(pos) = args.iter().position(|a| a == name) {
+        if let Some(val) = args.get(pos + 1) {
+            if val.starts_with("--") {
+                return Err(format!("missing value for flag '{name}'"));
+            }
+            Ok(Some(val.as_str()))
+        } else {
+            Err(format!("missing value for flag '{name}'"))
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 fn parse_flag<T: FromStr>(args: &[String], name: &str, default: T) -> Result<T, String> {
-    match flag(args, name) {
+    match flag(args, name)? {
         Some(val) => val.parse::<T>().map_err(|_| format!("invalid value for flag {name}: '{val}'")),
         None => Ok(default),
     }
 }
+
+const MAX_DATASET_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB limit (Decision D5)
 
 type CorpusSplits = (Vec<Vec<u32>>, Vec<Vec<u32>>);
 
@@ -28,30 +41,36 @@ fn load_or_generate_corpus(
     if let Some(path_str) = dataset_path {
         let p = Path::new(path_str);
         if path_str.ends_with(".rtok") {
-            let mut shard = sandy_rust::data::BufferedTokenShard::open(p, vocab_size, DEFAULT_MAX_BYTES)
+            let mut shard = sandy_rust::data::BufferedTokenShard::open(p, vocab_size, MAX_DATASET_BYTES)
                 .map_err(|e| format!("failed to open .rtok shard: {e:?}"))?;
-            let mut all_tokens = Vec::new();
+            let mut docs = Vec::new();
+            let mut current_doc = Vec::new();
             while let Some(tok) = shard.next_token().map_err(|e| format!("shard read error: {e:?}"))? {
                 if tok < 256 {
-                    all_tokens.push(tok);
+                    current_doc.push(tok);
+                } else if tok == 257 && !current_doc.is_empty() {
+                    docs.push(current_doc);
+                    current_doc = Vec::new();
                 }
             }
-            if all_tokens.is_empty() {
-                return Err("dataset shard contained no byte tokens < 256".into());
+            if !current_doc.is_empty() {
+                docs.push(current_doc);
             }
-            let mut docs = Vec::new();
-            for chunk in all_tokens.chunks(64) {
-                docs.push(chunk.to_vec());
+            if docs.is_empty() {
+                return Err("dataset shard contained no valid tokens".into());
             }
-            let split_idx = (docs.len() * 4 / 5).max(1);
+            if docs.len() < 2 {
+                return Err("corpus must contain at least 2 documents for disjoint train/val splits".into());
+            }
+            let split_idx = (docs.len() * 4 / 5).clamp(1, docs.len() - 1);
             let train_docs = docs[..split_idx].to_vec();
-            let val_docs = if split_idx < docs.len() {
-                docs[split_idx..].to_vec()
-            } else {
-                train_docs.clone()
-            };
+            let val_docs = docs[split_idx..].to_vec();
             Ok((train_docs, val_docs))
         } else {
+            let meta = fs::metadata(p).map_err(|e| format!("failed to stat dataset file: {e}"))?;
+            if meta.len() > MAX_DATASET_BYTES {
+                return Err(format!("dataset file exceeds 10 MiB budget ({} bytes)", meta.len()));
+            }
             let content = fs::read(p).map_err(|e| format!("failed to read dataset file: {e}"))?;
             let mut docs = Vec::new();
             for line in content.split(|&b| b == b'\n') {
@@ -59,16 +78,12 @@ fn load_or_generate_corpus(
                     docs.push(line.iter().map(|&b| b as u32).collect());
                 }
             }
-            if docs.is_empty() {
-                return Err("dataset file was empty".into());
+            if docs.len() < 2 {
+                return Err("corpus must contain at least 2 documents for disjoint train/val splits".into());
             }
-            let split_idx = (docs.len() * 4 / 5).max(1);
+            let split_idx = (docs.len() * 4 / 5).clamp(1, docs.len() - 1);
             let train_docs = docs[..split_idx].to_vec();
-            let val_docs = if split_idx < docs.len() {
-                docs[split_idx..].to_vec()
-            } else {
-                train_docs.clone()
-            };
+            let val_docs = docs[split_idx..].to_vec();
             Ok((train_docs, val_docs))
         }
     } else {
@@ -99,7 +114,11 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("verify") => {
             let default_gates = "g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14,gx12e,gx13,gx14,gx15";
-            let list = match flag(&args, "--gates") {
+            let gates_flag = match flag(&args, "--gates") {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let list = match gates_flag {
                 Some("all") => default_gates,
                 Some("baseline") => "g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14",
                 Some(custom) => custom,
@@ -113,7 +132,11 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let art_dir = flag(&args, "--artifacts").unwrap_or("artifacts");
+            let art_dir = match flag(&args, "--artifacts") {
+                Ok(Some(d)) => d,
+                Ok(None) => "artifacts",
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
             if let Err(e) = fs::create_dir_all(art_dir) {
                 eprintln!("failed to create evidence directory '{art_dir}': {e}");
                 return ExitCode::FAILURE;
@@ -176,7 +199,15 @@ fn main() -> ExitCode {
             if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
         Some("checkpoint") => {
-            if let Some(path) = flag(&args, "--init") {
+            let init_path = match flag(&args, "--init") {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let inspect_path = match flag(&args, "--inspect") {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            if let Some(path) = init_path {
                 let m = match Model::init(&cfg) {
                     Ok(m) => m,
                     Err(e) => {
@@ -188,7 +219,7 @@ fn main() -> ExitCode {
                     Ok(()) => println!("saved {} params to {path}", m.param_count()),
                     Err(e) => { eprintln!("save failed: {e:?}"); return ExitCode::FAILURE; }
                 }
-            } else if let Some(path) = flag(&args, "--inspect") {
+            } else if let Some(path) = inspect_path {
                 match checkpoint::load(Path::new(path), &cfg, DEFAULT_MAX_BYTES) {
                     Ok(m) => println!("valid checkpoint: {} params, {} layers", m.param_count(), m.layers.len()),
                     Err(e) => { eprintln!("rejected: {e:?}"); return ExitCode::FAILURE; }
@@ -200,7 +231,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("generate") => {
-            let model = match flag(&args, "--checkpoint") {
+            let ckpt_flag = match flag(&args, "--checkpoint") {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let model = match ckpt_flag {
                 Some(p) => match checkpoint::load(Path::new(p), &cfg, DEFAULT_MAX_BYTES) {
                     Ok(m) => m,
                     Err(e) => { eprintln!("rejected: {e:?}"); return ExitCode::FAILURE; }
@@ -218,7 +253,12 @@ fn main() -> ExitCode {
             };
             let tok = ByteTokenizer::new();
             let mut prompt = vec![BOS];
-            prompt.extend(tok.encode(flag(&args, "--prompt").unwrap_or("Rust")));
+            let prompt_text = match flag(&args, "--prompt") {
+                Ok(Some(s)) => s,
+                Ok(None) => "Rust",
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            prompt.extend(tok.encode(prompt_text));
 
             let temp: f32 = match parse_flag(&args, "--temperature", 0.0f32) {
                 Ok(v) => v,
@@ -293,16 +333,43 @@ fn main() -> ExitCode {
                 Ok(v) => v,
                 Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
             };
+            if steps == 0 {
+                eprintln!("--steps must be > 0");
+                return ExitCode::from(2);
+            }
             let lr: f32 = match parse_flag(&args, "--lr", 0.01f32) {
                 Ok(v) => v,
                 Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
             };
+            if !lr.is_finite() || lr <= 0.0 {
+                eprintln!("--lr must be positive and finite");
+                return ExitCode::from(2);
+            }
+            let stop_after: Option<usize> = match flag(&args, "--stop-after") {
+                Ok(Some(v)) => match v.parse::<usize>() {
+                    Ok(0) => { eprintln!("--stop-after must be > 0"); return ExitCode::from(2); }
+                    Ok(k) => Some(k),
+                    Err(e) => { eprintln!("invalid value for --stop-after: '{v}': {e}"); return ExitCode::from(2); }
+                },
+                Ok(None) => None,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let target_step = stop_after.unwrap_or(steps);
+
             let val_every: usize = match parse_flag(&args, "--val-every", (steps / 5).max(1)) {
                 Ok(v) => v,
                 Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
             };
+            if val_every == 0 {
+                eprintln!("--val-every must be > 0");
+                return ExitCode::from(2);
+            }
 
-            let (train_docs, val_docs) = match load_or_generate_corpus(flag(&args, "--dataset"), cfg.vocab_size) {
+            let dataset_arg = match flag(&args, "--dataset") {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let (train_docs, val_docs) = match load_or_generate_corpus(dataset_arg, cfg.vocab_size) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("dataset error: {e}");
@@ -317,7 +384,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let mut val_loader = match WindowLoader::new(&val_docs, cfg.max_seq_len, 1337) {
+            let val_loader = match WindowLoader::new(&val_docs, cfg.max_seq_len, 1337) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("val loader error: {e:?}");
@@ -335,8 +402,13 @@ fn main() -> ExitCode {
             let mut p = sandy_rust::autodiff::Params::<f32>::from_model(&m);
             let mut opt = AdamW::new(&p);
             let mut start_step = 1usize;
+            let mut sched = Schedule { eta_max: lr, eta_min: lr * 0.1, warmup: (steps / 5).max(1) as u64, max_steps: steps as u64 };
 
-            if let Some(resume_path) = flag(&args, "--resume") {
+            let resume_arg = match flag(&args, "--resume") {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            if let Some(resume_path) = resume_arg {
                 let state = match checkpoint::load_training(Path::new(resume_path), &cfg, &train_loader.corpus_hash(), DEFAULT_MAX_BYTES) {
                     Ok(s) => s,
                     Err(e) => {
@@ -344,9 +416,14 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
+                if target_step <= state.schedule_step {
+                    eprintln!("target step ({target_step}) must be greater than resumed schedule step ({})", state.schedule_step);
+                    return ExitCode::from(2);
+                }
                 m = state.model;
                 p = sandy_rust::autodiff::Params::<f32>::from_model(&m);
                 opt = state.optimizer;
+                sched = state.schedule;
                 if let Err(e) = train_loader.restore(state.loader_state) {
                     eprintln!("loader restore error: {e:?}");
                     return ExitCode::FAILURE;
@@ -355,19 +432,31 @@ fn main() -> ExitCode {
                 println!("Resumed training state from '{resume_path}' at step {start_step}");
             }
 
-            println!("Starting bounded train: steps={steps}, lr={lr}, start_step={start_step}...");
-            let sched = Schedule { eta_max: lr, eta_min: lr * 0.1, warmup: (steps / 5).max(1) as u64, max_steps: steps as u64 };
+            println!("Starting bounded train: steps={steps}, target_step={target_step}, lr={lr}, start_step={start_step}...");
 
-            for step in start_step..=steps {
+            for step in start_step..=target_step {
                 let train_window = train_loader.next_window();
                 let mut grads = p.zeros_like();
-                let n_denom = train_window.len().saturating_sub(1) as f32;
+                let n_valid_targets = train_window[..train_window.len().saturating_sub(1)]
+                    .iter()
+                    .zip(&train_window[1..])
+                    .filter(|(&tok, &tgt)| tok != cfg.pad_id && tgt != cfg.pad_id)
+                    .count();
+                let n_denom = (n_valid_targets.max(1)) as f32;
                 let o = match sandy_rust::autodiff::loss_and_grad(&cfg, &p, &train_window, n_denom, &mut grads) {
                     Ok(o) => o,
-                    Err(e) => { eprintln!("training step {step} error: {e:?}"); return ExitCode::FAILURE; }
+                    Err(e) => {
+                        eprintln!("warning: step {step} loss error: {e:?}, skipping window");
+                        opt.consecutive_skips += 1;
+                        if opt.consecutive_skips >= 5 {
+                            eprintln!("aborted training: exceeded 5 consecutive skips");
+                            return ExitCode::FAILURE;
+                        }
+                        continue;
+                    }
                 };
                 let train_loss = o.loss_sum / o.n_valid as f32;
-                let eta = sched.eta(step as u64);
+                let eta = sched.eta(opt.step + 1);
                 match opt.step_with_clipping(&mut p, &mut grads, eta, 1.0) {
                     Ok(true) => {},
                     Ok(false) => {
@@ -382,18 +471,27 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 }
-                if step % val_every == 0 || step == steps {
-                    let val_window = val_loader.next_window();
-                    let val_out = match sandy_rust::autodiff::forward_loss(&cfg, &p, &val_window) {
-                        Ok(l) => l,
-                        Err(e) => { eprintln!("eval error: {e:?}"); return ExitCode::FAILURE; }
-                    };
-                    let val_loss = val_out.loss_sum / val_out.n_valid as f32;
+                if step % val_every == 0 || step == target_step {
+                    let mut val_loss_sum = 0.0f32;
+                    let mut val_valid_sum = 0usize;
+                    for vw in val_loader.windows() {
+                        let vo = match sandy_rust::autodiff::forward_loss(&cfg, &p, vw) {
+                            Ok(l) => l,
+                            Err(e) => { eprintln!("eval error: {e:?}"); return ExitCode::FAILURE; }
+                        };
+                        val_loss_sum += vo.loss_sum;
+                        val_valid_sum += vo.n_valid;
+                    }
+                    let val_loss = if val_valid_sum > 0 { val_loss_sum / val_valid_sum as f32 } else { 0.0 };
                     println!("step {step:3}/{steps} | train_loss: {train_loss:.4} | val_loss: {val_loss:.4} | lr: {eta:.6}");
                 }
             }
 
-            if let Some(state_path) = flag(&args, "--save-state") {
+            let save_state_arg = match flag(&args, "--save-state") {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            if let Some(state_path) = save_state_arg {
                 let updated_model = match Model::from_params(&cfg, &p) {
                     Ok(m) => m,
                     Err(e) => {
@@ -406,7 +504,8 @@ fn main() -> ExitCode {
                     optimizer: opt.clone(),
                     loader_state: train_loader.state(),
                     rng_state: ([0u32; 16], [0u32; 16], 0),
-                    schedule_step: steps,
+                    schedule_step: opt.step as usize,
+                    schedule: sched,
                 };
                 if let Err(e) = checkpoint::save_training(&state, Path::new(state_path)) {
                     eprintln!("save-state error: {e:?}");
@@ -415,7 +514,11 @@ fn main() -> ExitCode {
                 println!("saved training state to {state_path}");
             }
 
-            if let Some(ckpt_path) = flag(&args, "--checkpoint") {
+            let ckpt_arg = match flag(&args, "--checkpoint") {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            if let Some(ckpt_path) = ckpt_arg {
                 let updated_model = match Model::from_params(&cfg, &p) {
                     Ok(m) => m,
                     Err(e) => {
@@ -432,8 +535,16 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("inspect") => {
-            let prompt = flag(&args, "--prompt").unwrap_or("Hello");
-            let mode = flag(&args, "--mode").unwrap_or("record");
+            let prompt = match flag(&args, "--prompt") {
+                Ok(Some(p)) => p,
+                Ok(None) => "Hello",
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let mode = match flag(&args, "--mode") {
+                Ok(Some(m)) => m,
+                Ok(None) => "record",
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
             let tok = ByteTokenizer::new();
             let mut prompt_tokens = vec![BOS];
             prompt_tokens.extend(tok.encode_bytes(prompt.as_bytes()));
@@ -502,8 +613,16 @@ fn main() -> ExitCode {
             let sub = args.get(1).map(String::as_str);
             match sub {
                 Some("flip") => {
-                    let task = flag(&args, "--task").unwrap_or("all");
-                    let split = flag(&args, "--split").unwrap_or("test");
+                    let task = match flag(&args, "--task") {
+                        Ok(Some(t)) => t,
+                        Ok(None) => "all",
+                        Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+                    };
+                    let split = match flag(&args, "--split") {
+                        Ok(Some(s)) => s,
+                        Ok(None) => "test",
+                        Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+                    };
                     println!("Running Paired Perturbation & Flip-Rate Evaluation (task: {task}, split: {split})...");
 
                     let mut families = Vec::new();

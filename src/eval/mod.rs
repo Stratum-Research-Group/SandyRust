@@ -297,12 +297,15 @@ pub fn assign_splits(
             match split {
                 Split::Train => {
                     train_prompts.insert(p.base_prompt.clone());
+                    train_prompts.insert(p.variant_prompt.clone());
                 }
                 Split::Dev => {
                     dev_prompts.insert(p.base_prompt.clone());
+                    dev_prompts.insert(p.variant_prompt.clone());
                 }
                 Split::Test => {
                     test_prompts.insert(p.base_prompt.clone());
+                    test_prompts.insert(p.variant_prompt.clone());
                 }
             }
         }
@@ -395,6 +398,9 @@ pub fn family_clustered_bootstrap(
     if families.is_empty() {
         return Err(EvalError::Underpowered { families: 0, min: 1 });
     }
+    if resample_count == 0 {
+        return Err(EvalError::Underpowered { families: families.len(), min: 1 });
+    }
     let mut rng = Rng::new(seed);
     let n = families.len();
     let mut selectivities = Vec::with_capacity(resample_count);
@@ -404,7 +410,7 @@ pub fn family_clustered_bootstrap(
     for f in families {
         let mut slice = Vec::new();
         for (pair, pred) in predictions {
-            if f.pairs.iter().any(|p| std::ptr::eq(p, *pair)) {
+            if f.pairs.iter().any(|p| p == *pair) {
                 slice.push((*pair, pred));
             }
         }
@@ -428,7 +434,7 @@ pub fn family_clustered_bootstrap(
     }
 
     if selectivities.is_empty() {
-        return Ok(BootstrapInterval { lower: 0.0, mean: 0.0, upper: 0.0 });
+        return Err(EvalError::Underpowered { families: n, min: 1 });
     }
 
     selectivities.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

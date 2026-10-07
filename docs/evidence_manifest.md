@@ -1,6 +1,8 @@
 # SandyRust Gate Evidence Manifest & Verification Contract
 
 **Specification Authority:** `specv3.md` §1, §9, §13  
+- Local Workspace Specification SHA-256: `93c9f564927d1dbf5cb47e204810fc44e1c0952ff38cc6558da91c97cbb32bb1`
+- External Reference Specification SHA-256: `27f542a043c7b8e1f57d6eaef23df46497f5f9e578f2441a5fe2bbdf70f17e08`
 **Schema Version:** 3.1  
 **Target Profile:** `reference_v2` (V=259, D=128, L=4, H_q=H_kv=4, tied P=886,272)  
 **Execution Baseline:** Strict CPU Pure Rust (`std` only, Decision D2-R1)

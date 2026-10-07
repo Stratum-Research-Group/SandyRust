@@ -260,6 +260,9 @@ impl DirectionHeader {
         if self.tokenizer_fingerprint != tokenizer_fingerprint {
             return Err(HookError::DirectionMismatch { field: "tokenizer_fingerprint".to_string() });
         }
+        if !self.norm.is_finite() || self.norm < 0.0 {
+            return Err(HookError::InvalidSteering { reason: "non-finite or negative direction header norm".to_string() });
+        }
         if direction.iter().any(|x| !x.is_finite()) {
             return Err(HookError::InvalidSteering { reason: "non-finite direction element".to_string() });
         }
@@ -284,23 +287,36 @@ pub fn compute_intervention_policy_hash(edits: &[EditOp]) -> [u8; 32] {
     let mut s = String::new();
     for edit in edits {
         match edit {
-            EditOp::Ablate { hook, kind } => {
-                s.push_str(&format!(
-                    "ablate:l{}:s{}:h{:?}:k{:?};",
-                    hook.layer,
-                    hook.site.as_str(),
-                    hook.head,
-                    matches!(kind, AblateKind::Zero)
-                ));
-            }
+            EditOp::Ablate { hook, kind } => match kind {
+                AblateKind::Zero => {
+                    s.push_str(&format!(
+                        "ablate:zero:l{}:s{}:h{:?};",
+                        hook.layer,
+                        hook.site.as_str(),
+                        hook.head
+                    ));
+                }
+                AblateKind::MeanFromSink(t) => {
+                    let th = sha256(&t.to_le_bytes());
+                    s.push_str(&format!(
+                        "ablate:sink:l{}:s{}:h{:?}:sh{:?}:th{:02x?};",
+                        hook.layer,
+                        hook.site.as_str(),
+                        hook.head,
+                        t.shape(),
+                        th
+                    ));
+                }
+            },
             EditOp::Patch { hook, source } => {
                 let h = sha256(&source.to_le_bytes());
                 s.push_str(&format!(
-                    "patch:l{}:s{}:h{:?}:sh{:02x?};",
+                    "patch:l{}:s{}:h{:?}:sh{:?}:th{:02x?};",
                     hook.layer,
                     hook.site.as_str(),
                     hook.head,
-                    &h[..8]
+                    source.shape(),
+                    h
                 ));
             }
             EditOp::Steer { hook, direction, alpha, positions, direction_id } => {
@@ -310,14 +326,14 @@ pub fn compute_intervention_policy_hash(edits: &[EditOp]) -> [u8; 32] {
                 }
                 let dh = sha256(&bytes);
                 s.push_str(&format!(
-                    "steer:l{}:s{}:h{:?}:id{}:a{:.6}:p{:?}:dh{:02x?};",
+                    "steer:l{}:s{}:h{:?}:id{}:abits{:08x}:p{:?}:dh{:02x?};",
                     hook.layer,
                     hook.site.as_str(),
                     hook.head,
                     direction_id,
-                    alpha,
+                    alpha.to_bits(),
                     positions,
-                    &dh[..8]
+                    dh
                 ));
             }
         }
@@ -369,6 +385,12 @@ impl HookContext {
         let l_count = c.n_layers;
         let q_heads = c.n_q_heads;
 
+        if !self.alpha_max.is_finite() || self.alpha_max <= 0.0 {
+            return Err(HookError::InvalidSteering {
+                reason: format!("invalid alpha_max {}", self.alpha_max),
+            });
+        }
+
         for (hook, _) in &self.records {
             if hook.site.is_layer_site() && hook.layer as usize >= l_count {
                 return Err(HookError::UnknownSite {
@@ -393,6 +415,14 @@ impl HookContext {
                     layer: hook.layer,
                     site: hook.site.as_str().to_string(),
                 });
+            }
+            if let Some(h) = hook.head {
+                if h as usize >= q_heads {
+                    return Err(HookError::UnknownSite {
+                        layer: hook.layer,
+                        site: format!("{}:head{}", hook.site.as_str(), h),
+                    });
+                }
             }
             match edit {
                 EditOp::Steer { hook, direction, alpha, .. } => {

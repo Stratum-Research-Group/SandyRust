@@ -79,25 +79,25 @@ impl Config {
     }
 
     pub fn head_dim(&self) -> usize {
-        self.d_model / self.n_q_heads
+        self.d_model.checked_div(self.n_q_heads).unwrap_or(0)
     }
 
     /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
     pub fn fingerprint(&self) -> [u8; 32] {
         let s = if !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora {
             format!(
-                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th{:.6}:eps{:.8}:bos{}:eos{}:pad{}:tied{}:seed{}",
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
                 self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
-                self.batch_size, self.rope_theta, self.rms_eps,
+                self.batch_size, self.rope_theta.to_bits(), self.rms_eps.to_bits(),
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed
             )
         } else {
             format!(
-                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th{:.6}:eps{:.8}:bos{}:eos{}:pad{}:tied{}:seed{}:x13h{}:x13e{}:x12e{}:x15l{}",
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x13h{}:x13e{}:x12e{}:x15l{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
                 self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
-                self.batch_size, self.rope_theta, self.rms_eps,
+                self.batch_size, self.rope_theta.to_bits(), self.rms_eps.to_bits(),
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed,
                 self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora
             )
@@ -122,6 +122,7 @@ impl Config {
             (self.n_kv_heads, "n_kv_heads"),
             (self.n_layers, "n_layers"),
             (self.d_ff, "d_ff"),
+            (self.batch_size, "batch_size"),
         ] {
             if v == 0 {
                 return Err(ConfigError::OutOfRange(name));

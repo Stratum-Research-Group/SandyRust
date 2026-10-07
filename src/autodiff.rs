@@ -252,8 +252,15 @@ pub fn loss_and_grad<T: Float>(
     if denom <= T::ZERO || !denom.is_finite() {
         return Err(TrainError::InvalidArgument("denom must be positive and finite"));
     }
-    if grads.data.len() != p.data.len() {
-        return Err(TrainError::InvalidArgument("grads layout mismatch"));
+    let inv = crate::model::inventory(cfg);
+    if p.data.len() != inv.len() || grads.data.len() != inv.len() {
+        return Err(TrainError::InvalidArgument("params/grads layout mismatch with inventory"));
+    }
+    for (ti, (_, shape)) in inv.iter().enumerate() {
+        let expected_len = shape.iter().product::<usize>();
+        if p.data[ti].len() != expected_len || grads.data[ti].len() != expected_len {
+            return Err(TrainError::InvalidArgument("params/grads tensor shape mismatch"));
+        }
     }
     let n = window.len() - 1;
     let (tokens, targets) = (&window[..n], &window[1..]);
@@ -506,14 +513,161 @@ pub fn loss_and_grad<T: Float>(
     Ok(LossOut { loss_sum, n_valid })
 }
 
-/// Forward-only cross-entropy loss calculation without modifying caller's gradients.
+/// Forward-only cross-entropy loss calculation without modifying gradients,
+/// creating backward tapes, or executing backward propagation.
 pub fn forward_loss<T: Float>(
     cfg: &Config,
     p: &Params<T>,
     window: &[u32],
 ) -> Result<LossOut<T>, TrainError> {
-    let mut dummy_grads = p.zeros_like();
-    loss_and_grad(cfg, p, window, T::ONE, &mut dummy_grads)
+    if window.len() < 2 {
+        return Err(TrainError::WindowTooShort);
+    }
+    if window.len() > cfg.max_seq_len + 1 {
+        return Err(TrainError::InvalidArgument("window length exceeds max_seq_len + 1"));
+    }
+    if !p.all_finite() {
+        return Err(TrainError::NonFiniteWeights);
+    }
+    let inv = crate::model::inventory(cfg);
+    if p.data.len() != inv.len() {
+        return Err(TrainError::InvalidArgument("params layout mismatch with inventory"));
+    }
+    for (ti, (_, shape)) in inv.iter().enumerate() {
+        let expected_len = shape.iter().product::<usize>();
+        if p.data[ti].len() != expected_len {
+            return Err(TrainError::InvalidArgument("params tensor shape mismatch"));
+        }
+    }
+    let n = window.len() - 1;
+    let (tokens, targets) = (&window[..n], &window[1..]);
+    let (d, vs, dh, hq, hkv, dff) = (cfg.d_model, cfg.vocab_size, cfg.head_dim(), cfg.n_q_heads, cfg.n_kv_heads, cfg.d_ff);
+    let (qd, kd, group) = (hq * dh, hkv * dh, hq / hkv);
+    for &t in window {
+        if t as usize >= vs {
+            return Err(TrainError::TokenOutOfRange(t));
+        }
+    }
+    let valid: Vec<bool> = tokens.iter().map(|&t| t != cfg.pad_id).collect();
+    let eps = T::from_f64(cfg.rms_eps as f64);
+    let scale = T::ONE / T::from_f64(dh as f64).sqrt();
+    let embed = &p.data[0];
+
+    let mut x = vec![T::ZERO; n * d];
+    for t in 0..n {
+        let id = tokens[t] as usize;
+        x[t * d..(t + 1) * d].copy_from_slice(&embed[id * d..(id + 1) * d]);
+    }
+    for l in 0..cfg.n_layers {
+        let b = 1 + 9 * l;
+        let (g1, wq, wk, wv, wo, g2, wg, wu, wd_) =
+            (&p.data[b], &p.data[b + 1], &p.data[b + 2], &p.data[b + 3], &p.data[b + 4], &p.data[b + 5], &p.data[b + 6], &p.data[b + 7], &p.data[b + 8]);
+        let (r1, _) = rms_fwd(&x, n, d, g1, eps);
+        let q = mm(&r1, n, d, wq, qd);
+        let k = mm(&r1, n, d, wk, kd);
+        let v = mm(&r1, n, d, wv, kd);
+        let mut qr = vec![T::ZERO; hq * n * dh];
+        for h in 0..hq {
+            for t in 0..n {
+                qr[h * n * dh + t * dh..h * n * dh + (t + 1) * dh].copy_from_slice(&q[t * qd + h * dh..t * qd + (h + 1) * dh]);
+            }
+            rope_apply(&mut qr[h * n * dh..(h + 1) * n * dh], n, dh, cfg.rope_theta, false);
+        }
+        let mut kr = vec![T::ZERO; hkv * n * dh];
+        for h in 0..hkv {
+            for t in 0..n {
+                kr[h * n * dh + t * dh..h * n * dh + (t + 1) * dh].copy_from_slice(&k[t * kd + h * dh..t * kd + (h + 1) * dh]);
+            }
+            rope_apply(&mut kr[h * n * dh..(h + 1) * n * dh], n, dh, cfg.rope_theta, false);
+        }
+        let mut merged = vec![T::ZERO; n * qd];
+        for h in 0..hq {
+            let kvh = h / group;
+            let qh = &qr[h * n * dh..(h + 1) * n * dh];
+            let kh = &kr[kvh * n * dh..(kvh + 1) * n * dh];
+            for i in 0..n {
+                if !valid[i] {
+                    continue;
+                }
+                let mut scores = vec![T::ZERO; i + 1];
+                let mut mx: Option<T> = None;
+                for j in 0..=i {
+                    if !valid[j] {
+                        continue;
+                    }
+                    let mut s = T::ZERO;
+                    for c in 0..dh {
+                        s += qh[i * dh + c] * kh[j * dh + c];
+                    }
+                    let s = s * scale;
+                    scores[j] = s;
+                    if mx.is_none_or(|m| s > m) {
+                        mx = Some(s);
+                    }
+                }
+                let mx = mx.ok_or(TrainError::AllMaskedRow(i))?;
+                let mut sum = T::ZERO;
+                for j in 0..=i {
+                    if valid[j] {
+                        scores[j] = (scores[j] - mx).exp();
+                        sum += scores[j];
+                    }
+                }
+                for j in 0..=i {
+                    if valid[j] {
+                        let pij = scores[j] / sum;
+                        for c in 0..dh {
+                            merged[i * qd + h * dh + c] += pij * v[j * kd + kvh * dh + c];
+                        }
+                    }
+                }
+            }
+        }
+        let a = mm(&merged, n, qd, wo, d);
+        let mut x1 = x;
+        add_into(&mut x1, &a);
+        let (r2, _) = rms_fwd(&x1, n, d, g2, eps);
+        let gate = mm(&r2, n, d, wg, dff);
+        let up = mm(&r2, n, d, wu, dff);
+        let hid: Vec<T> = gate.iter().zip(&up).map(|(&g, &u)| g / (T::ONE + (-g).exp()) * u).collect();
+        let f = mm(&hid, n, dff, wd_, d);
+        let mut x2 = x1;
+        add_into(&mut x2, &f);
+        x = x2;
+    }
+    let gf = &p.data[1 + 9 * cfg.n_layers];
+    let (xf, _) = rms_fwd(&x, n, d, gf, eps);
+    let logits = mm_bt(&xf, n, d, embed, vs);
+
+    let mut loss_sum = T::ZERO;
+    let mut n_valid = 0usize;
+    for i in 0..n {
+        if !valid[i] || targets[i] == cfg.pad_id {
+            continue;
+        }
+        n_valid += 1;
+        let z = &logits[i * vs..(i + 1) * vs];
+        let mut mx = z[0];
+        for &v in z {
+            if v > mx {
+                mx = v;
+            }
+        }
+        let mut s = T::ZERO;
+        for &v in z {
+            s += (v - mx).exp();
+        }
+        let lse = mx + s.ln();
+        let y = targets[i] as usize;
+        loss_sum += lse - z[y];
+    }
+    if n_valid == 0 {
+        return Err(TrainError::NoValidTokens);
+    }
+    if !loss_sum.is_finite() {
+        return Err(TrainError::NonFiniteWeights);
+    }
+    Ok(LossOut { loss_sum, n_valid })
 }
 
 #[derive(Debug, Clone, PartialEq)]

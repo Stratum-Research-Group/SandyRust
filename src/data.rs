@@ -307,6 +307,10 @@ impl WindowLoader {
     pub fn is_empty(&self) -> bool {
         self.windows.is_empty()
     }
+    pub fn windows(&self) -> &[Vec<u32>] {
+        &self.windows
+    }
+
     pub fn state(&self) -> LoaderState {
         self.state
     }

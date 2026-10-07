@@ -80,6 +80,21 @@ impl AdamW {
             return Err(TrainError::InvalidArgument("eta must be finite and non-negative"));
         }
 
+        if self.m.len() != params.data.len() || self.v.len() != params.data.len() || grads.data.len() != params.data.len() {
+            return Err(TrainError::InvalidArgument("optimizer moments and params layout count mismatch"));
+        }
+        for ti in 0..params.data.len() {
+            if self.m[ti].len() != params.data[ti].len() || self.v[ti].len() != params.data[ti].len() || grads.data[ti].len() != params.data[ti].len() {
+                return Err(TrainError::InvalidArgument("optimizer moments and params tensor shape mismatch"));
+            }
+        }
+        if !self.m.iter().all(|t| t.iter().all(|x| x.is_finite())) {
+            return Err(TrainError::InvalidArgument("non-finite existing moment m"));
+        }
+        if !self.v.iter().all(|t| t.iter().all(|x| x.is_finite() && *x >= 0.0)) {
+            return Err(TrainError::InvalidArgument("non-finite or negative existing moment v"));
+        }
+
         let next_step = self.step + 1;
         let t = next_step.min(i32::MAX as u64) as i32;
         let bc1 = (1.0 - (BETA1 as f64).powi(t)) as f32;
@@ -95,6 +110,9 @@ impl AdamW {
                 let g = grads.data[ti][i];
                 let m = BETA1 * self.m[ti][i] + (1.0 - BETA1) * g;
                 let v = BETA2 * self.v[ti][i] + (1.0 - BETA2) * g * g;
+                if !m.is_finite() || !v.is_finite() || v < 0.0 {
+                    return Err(TrainError::NonFiniteWeights);
+                }
                 next_m[ti][i] = m;
                 next_v[ti][i] = v;
                 let w = params.data[ti][i];
@@ -124,6 +142,9 @@ impl AdamW {
         eta: f32,
         max_norm: f32,
     ) -> Result<bool, TrainError> {
+        if !(max_norm.is_finite() && max_norm > 0.0) {
+            return Err(TrainError::InvalidArgument("max_norm must be positive and finite"));
+        }
         if !grads.all_finite() {
             self.consecutive_skips += 1;
             if self.consecutive_skips > 5 {
@@ -138,8 +159,14 @@ impl AdamW {
 
 /// Clip the global L2 norm to `max_norm`; returns the pre-clip norm.
 pub fn clip_global_norm(g: &mut Params<f32>, max_norm: f32) -> f64 {
+    if !(max_norm.is_finite() && max_norm > 0.0) {
+        return 0.0;
+    }
     let sq: f64 = g.data.iter().flat_map(|d| d.iter()).map(|&x| (x as f64) * (x as f64)).sum();
     let norm = sq.sqrt();
+    if !norm.is_finite() {
+        return norm;
+    }
     if norm > max_norm as f64 {
         let s = (max_norm as f64 / norm) as f32;
         for d in &mut g.data {

@@ -130,8 +130,16 @@ impl KVCache {
         Ok(())
     }
 
-    pub fn commit_step(&mut self) {
+    pub fn commit_step(&mut self) -> Result<(), CacheError> {
+        if self.seq_len >= self.max_seq_len {
+            return Err(CacheError::CapacityExceeded {
+                current: self.seq_len,
+                requested: 1,
+                max: self.max_seq_len,
+            });
+        }
         self.seq_len += 1;
+        Ok(())
     }
 }
 
@@ -264,14 +272,55 @@ pub fn forward_step_with_hooks(
 
         // Apply RoPE at current absolute position pos
         let mut k_rope = Tensor::zeros(&[1, kv_dim])?;
+        let mut v_staged = Tensor::zeros(&[1, kv_dim])?;
         for kvh in 0..c.n_kv_heads {
-            let col = slice_cols(&k, kvh * dh, dh)?;
-            let col_r = rope(&col, c.rope_theta, pos)?;
+            let k_col = slice_cols(&k, kvh * dh, dh)?;
+
+            // Site 4b: KPreRope
+            if let Some(hook_ctx) = ctx {
+                let hook = crate::hooks::HookId::head(layer_u16, crate::hooks::HookSite::KPreRope, kvh as u16);
+                if let Some(ref mut s) = sink {
+                    crate::hooks::apply_records(&hook, &k_col, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+                }
+            }
+
+            let mut col_r = rope(&k_col, c.rope_theta, pos)?;
+
+            // Site 4c: K
+            if let Some(hook_ctx) = ctx {
+                let hook = crate::hooks::HookId::head(layer_u16, crate::hooks::HookSite::K, kvh as u16);
+                if let Some(ref mut s) = sink {
+                    crate::hooks::apply_records(&hook, &col_r, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+                }
+                if !hook_ctx.edits.is_empty() {
+                    crate::hooks::apply_edits(&hook, &mut col_r, &hook_ctx.edits, pos, 1)?;
+                }
+                if let Some(ref mut s) = sink {
+                    crate::hooks::apply_records(&hook, &col_r, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+                }
+            }
             k_rope.data_mut()[kvh * dh..(kvh + 1) * dh].copy_from_slice(col_r.data());
+
+            let mut v_col = slice_cols(&v, kvh * dh, dh)?;
+
+            // Site 4d: V
+            if let Some(hook_ctx) = ctx {
+                let hook = crate::hooks::HookId::head(layer_u16, crate::hooks::HookSite::V, kvh as u16);
+                if let Some(ref mut s) = sink {
+                    crate::hooks::apply_records(&hook, &v_col, crate::hooks::RecordTiming::PreEdit, &hook_ctx.records, s)?;
+                }
+                if !hook_ctx.edits.is_empty() {
+                    crate::hooks::apply_edits(&hook, &mut v_col, &hook_ctx.edits, pos, 1)?;
+                }
+                if let Some(ref mut s) = sink {
+                    crate::hooks::apply_records(&hook, &v_col, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+                }
+            }
+            v_staged.data_mut()[kvh * dh..(kvh + 1) * dh].copy_from_slice(v_col.data());
         }
 
         staged_k.push(k_rope);
-        staged_v.push(v);
+        staged_v.push(v_staged);
 
         // History 0..pos from cache plus current step pos
         let cached_k_prev = if pos > 0 { slice_rows(&cache.k[l_idx], 0, pos)? } else { Tensor::zeros(&[0, kv_dim])? };
@@ -308,7 +357,16 @@ pub fn forward_step_with_hooks(
 
             let kh = slice_cols(&current_k_tensor, kvh * dh, dh)?;
             let vh = slice_cols(&current_v_tensor, kvh * dh, dh)?;
-            let (mut o, _) = attention_ref(&qh, &kh, &vh, &q_valid, &k_valid, pos)?;
+            let (mut o, probs) = attention_ref(&qh, &kh, &vh, &q_valid, &k_valid, pos)?;
+
+            // Site 6: AttnPattern
+            if let Some(hook_ctx) = ctx {
+                let hook = crate::hooks::HookId::head(layer_u16, crate::hooks::HookSite::AttnPattern, h as u16);
+                if let Some(ref mut s) = sink {
+                    let probs_tensor = Tensor::from_vec(&[1, k_len], probs)?;
+                    crate::hooks::apply_records(&hook, &probs_tensor, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+                }
+            }
 
             // Site 7: HeadOut
             if let Some(hook_ctx) = ctx {
@@ -461,7 +519,7 @@ pub fn forward_step_with_hooks(
         cache.append_step(l_idx, staged_k[l_idx].data(), staged_v[l_idx].data(), pos)
             .map_err(|_| TensorError::InvalidArgument("cache append"))?;
     }
-    cache.commit_step();
+    cache.commit_step()?;
 
     Ok(logits)
 }

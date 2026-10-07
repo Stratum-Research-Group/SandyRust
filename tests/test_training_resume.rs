@@ -75,6 +75,7 @@ fn test_n2_training_state_resume_identical_to_uninterrupted() {
         loader_state: loader_part1.state(),
         rng_state: ([1u32; 16], [2u32; 16], 3),
         schedule_step: split_step,
+        schedule: sched.clone(),
     };
     checkpoint::save_training(&state_k, &tmp_path).expect("save_training");
 

@@ -128,6 +128,12 @@ impl<'a> Reader<'a> {
     fn u64(&mut self) -> Result<u64, CheckpointError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.pos)
+    }
+    fn is_empty(&self) -> bool {
+        self.pos >= self.b.len()
+    }
 }
 
 /// Validate and decode a checkpoint for `cfg`. Never panics on malformed input.
@@ -275,6 +281,8 @@ pub fn save(model: &Model, path: &Path) -> Result<(), CheckpointError> {
     result
 }
 
+pub const TRAINING_VERSION: u32 = 2;
+
 /// Complete training resumption state (§8.2, Item 10).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TrainingState {
@@ -283,6 +291,7 @@ pub struct TrainingState {
     pub loader_state: crate::data::LoaderState,
     pub rng_state: ([u32; 16], [u32; 16], usize),
     pub schedule_step: usize,
+    pub schedule: crate::optimizer::Schedule,
 }
 
 pub fn serialize_training(state: &TrainingState) -> Vec<u8> {
@@ -294,6 +303,12 @@ pub fn serialize_training(state: &TrainingState) -> Vec<u8> {
     body.extend_from_slice(&(state.schedule_step as u64).to_le_bytes());
     body.extend_from_slice(&state.optimizer.step.to_le_bytes());
     body.extend_from_slice(&(state.optimizer.consecutive_skips as u64).to_le_bytes());
+
+    // Schedule parameters
+    body.extend_from_slice(&state.schedule.eta_max.to_bits().to_le_bytes());
+    body.extend_from_slice(&state.schedule.eta_min.to_bits().to_le_bytes());
+    body.extend_from_slice(&state.schedule.warmup.to_le_bytes());
+    body.extend_from_slice(&state.schedule.max_steps.to_le_bytes());
 
     body.extend_from_slice(&state.loader_state.position.to_le_bytes());
     body.extend_from_slice(&state.loader_state.epoch.to_le_bytes());
@@ -329,7 +344,7 @@ pub fn serialize_training(state: &TrainingState) -> Vec<u8> {
     let checksum = sha256(&body);
     let mut out = Vec::new();
     out.extend_from_slice(TRAINING_MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&TRAINING_VERSION.to_le_bytes());
     out.extend_from_slice(&body);
     out.extend_from_slice(&checksum);
     out
@@ -359,7 +374,7 @@ pub fn parse_training(
         return Err(CheckpointError::BadMagic);
     }
     let v = r.u32()?;
-    if v != VERSION {
+    if v != 1 && v != 2 {
         return Err(CheckpointError::UnsupportedVersion(v));
     }
 
@@ -373,9 +388,32 @@ pub fn parse_training(
         return Err(CheckpointError::CorpusMismatch);
     }
 
-    let schedule_step = r.u64()? as usize;
+    let schedule_step = usize::try_from(r.u64()?).map_err(|_| CheckpointError::OutOfBounds)?;
     let opt_step = r.u64()?;
-    let consecutive_skips = r.u64()? as usize;
+    let consecutive_skips = usize::try_from(r.u64()?).map_err(|_| CheckpointError::OutOfBounds)?;
+
+    let schedule = if v >= 2 {
+        let eta_max = f32::from_bits(r.u32()?);
+        let eta_min = f32::from_bits(r.u32()?);
+        let warmup = r.u64()?;
+        let max_steps = r.u64()?;
+        if !eta_max.is_finite() || eta_max <= 0.0 || !eta_min.is_finite() || eta_min < 0.0 || max_steps == 0 {
+            return Err(CheckpointError::TrainingState("invalid schedule parameters in checkpoint".into()));
+        }
+        crate::optimizer::Schedule {
+            eta_max,
+            eta_min,
+            warmup,
+            max_steps,
+        }
+    } else {
+        crate::optimizer::Schedule {
+            eta_max: 0.01,
+            eta_min: 0.001,
+            warmup: 1,
+            max_steps: schedule_step.max(1) as u64,
+        }
+    };
 
     let loader_position = r.u64()?;
     let loader_epoch = r.u64()?;
@@ -389,18 +427,37 @@ pub fn parse_training(
     for s in &mut rng_s1 {
         *s = r.u32()?;
     }
-    let rng_idx = r.u64()? as usize;
+    let rng_idx = usize::try_from(r.u64()?).map_err(|_| CheckpointError::OutOfBounds)?;
+    if rng_idx > 16 {
+        return Err(CheckpointError::TrainingState(format!("invalid rng_idx: {rng_idx} > 16")));
+    }
 
-    let model_bytes_len = r.u64()? as usize;
+    let model_bytes_len = usize::try_from(r.u64()?).map_err(|_| CheckpointError::OutOfBounds)?;
+    if model_bytes_len > r.remaining() {
+        return Err(CheckpointError::Truncated);
+    }
     let model_bytes = r.take(model_bytes_len)?;
     let model = parse(model_bytes, cfg, max_bytes)?;
 
-    let num_m = r.u32()? as usize;
+    let inv = inventory(cfg);
+
+    let num_m = usize::try_from(r.u32()?).map_err(|_| CheckpointError::OutOfBounds)?;
+    if num_m != inv.len() {
+        return Err(CheckpointError::TrainingState(format!("m count {num_m} != inventory {}", inv.len())));
+    }
     let mut m = Vec::with_capacity(num_m);
-    for _ in 0..num_m {
-        let len = r.u64()? as usize;
+    for (ti, inv_item) in inv.iter().enumerate().take(num_m) {
+        let expected_len = inv_item.1.iter().product::<usize>();
+        let len = usize::try_from(r.u64()?).map_err(|_| CheckpointError::OutOfBounds)?;
+        if len != expected_len {
+            return Err(CheckpointError::TrainingState(format!("m[{ti}] length {len} != inventory {expected_len}")));
+        }
+        let byte_len = len.checked_mul(4).ok_or(CheckpointError::OutOfBounds)?;
+        if byte_len > r.remaining() {
+            return Err(CheckpointError::Truncated);
+        }
         let mut vec = Vec::with_capacity(len);
-        let raw = r.take(len.checked_mul(4).ok_or(CheckpointError::OutOfBounds)?)?;
+        let raw = r.take(byte_len)?;
         for chunk in raw.chunks_exact(4) {
             let val = f32::from_le_bytes(chunk.try_into().unwrap());
             if !val.is_finite() {
@@ -411,20 +468,35 @@ pub fn parse_training(
         m.push(vec);
     }
 
-    let num_v = r.u32()? as usize;
+    let num_v = usize::try_from(r.u32()?).map_err(|_| CheckpointError::OutOfBounds)?;
+    if num_v != inv.len() {
+        return Err(CheckpointError::TrainingState(format!("v count {num_v} != inventory {}", inv.len())));
+    }
     let mut v_vecs = Vec::with_capacity(num_v);
-    for _ in 0..num_v {
-        let len = r.u64()? as usize;
+    for (ti, inv_item) in inv.iter().enumerate().take(num_v) {
+        let expected_len = inv_item.1.iter().product::<usize>();
+        let len = usize::try_from(r.u64()?).map_err(|_| CheckpointError::OutOfBounds)?;
+        if len != expected_len {
+            return Err(CheckpointError::TrainingState(format!("v[{ti}] length {len} != inventory {expected_len}")));
+        }
+        let byte_len = len.checked_mul(4).ok_or(CheckpointError::OutOfBounds)?;
+        if byte_len > r.remaining() {
+            return Err(CheckpointError::Truncated);
+        }
         let mut vec = Vec::with_capacity(len);
-        let raw = r.take(len.checked_mul(4).ok_or(CheckpointError::OutOfBounds)?)?;
+        let raw = r.take(byte_len)?;
         for chunk in raw.chunks_exact(4) {
             let val = f32::from_le_bytes(chunk.try_into().unwrap());
-            if !val.is_finite() {
-                return Err(CheckpointError::NonFinite("optimizer moment v".into()));
+            if !val.is_finite() || val < 0.0 {
+                return Err(CheckpointError::NonFinite("optimizer moment v non-finite or negative".into()));
             }
             vec.push(val);
         }
         v_vecs.push(vec);
+    }
+
+    if !r.is_empty() {
+        return Err(CheckpointError::TrainingState("trailing unparsed bytes in training payload".into()));
     }
 
     let optimizer = crate::optimizer::AdamW {
@@ -447,6 +519,7 @@ pub fn parse_training(
         loader_state,
         rng_state: (rng_s0, rng_s1, rng_idx),
         schedule_step,
+        schedule,
     })
 }
 
@@ -546,10 +619,7 @@ mod tests {
     #[test]
     fn training_state_roundtrip() {
         let m = model();
-        let p = crate::autodiff::Params {
-            shapes: vec![vec![2]],
-            data: vec![vec![1.0, 2.0]],
-        };
+        let p = crate::autodiff::Params::<f32>::from_model(&m);
         let opt = crate::optimizer::AdamW::new(&p);
         let corpus_hash = [42u8; 32];
         let loader_state = crate::data::LoaderState {
@@ -566,14 +636,23 @@ mod tests {
             loader_state,
             rng_state,
             schedule_step: 5,
+            schedule: crate::optimizer::Schedule {
+                eta_max: 0.01,
+                eta_min: 0.001,
+                warmup: 2,
+                max_steps: 10,
+            },
         };
 
         let bytes = serialize_training(&state);
         let loaded = parse_training(&bytes, &state.model.cfg, &corpus_hash, DEFAULT_MAX_BYTES).unwrap();
         assert_eq!(state.schedule_step, loaded.schedule_step);
         assert_eq!(state.optimizer.step, loaded.optimizer.step);
+        assert_eq!(state.optimizer.m, loaded.optimizer.m);
+        assert_eq!(state.optimizer.v, loaded.optimizer.v);
         assert_eq!(state.loader_state.position, loaded.loader_state.position);
         assert_eq!(state.rng_state, loaded.rng_state);
+        assert_eq!(state.schedule, loaded.schedule);
 
         // Mismatched corpus rejected
         let bad_corpus = [99u8; 32];
@@ -581,6 +660,19 @@ mod tests {
             parse_training(&bytes, &state.model.cfg, &bad_corpus, DEFAULT_MAX_BYTES).unwrap_err(),
             CheckpointError::CorpusMismatch
         );
+
+        // Trailing bytes rejected
+        let mut with_trailing = bytes.clone();
+        let body_end = with_trailing.len() - 32;
+        with_trailing.insert(body_end, 0xAA);
+        // recompute checksum
+        let new_end = with_trailing.len() - 32;
+        let new_cs = sha256(&with_trailing[8..new_end]);
+        with_trailing[new_end..].copy_from_slice(&new_cs);
+        assert!(matches!(
+            parse_training(&with_trailing, &state.model.cfg, &corpus_hash, DEFAULT_MAX_BYTES),
+            Err(CheckpointError::TrainingState(_))
+        ));
     }
 
     #[test]

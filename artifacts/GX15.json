@@ -8,8 +8,8 @@
   "implemented_check": "Zero-init bitwise match + FP64 central diff gradcheck + base immutability + merge delta W check + header integrity",
   "prerequisites": "Config::reference_v2",
   "exclusions": "None",
-  "revision": "cb898cc",
-  "dirty_state": false,
+  "revision": "553707d",
+  "dirty_state": true,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo test --test test_x15_lora",
@@ -17,10 +17,10 @@
   "device": "cpu",
   "dtype": "f32",
   "config": "reference_v2",
-  "fixture_hash": "21bebb6238d52c753eea47b885679485fe0068f4a9195544d6d4d9ae26c6fc45",
+  "fixture_hash": "22a524f0b88d9213f2b5d6f69c1f64e07c740b6ab5bc58d5608d288bbf778dfa",
   "expected": "Zero-init match, analytic gradients agree with finite differences, base tensors untouched",
   "observed": "zero_init=true, grad_parity=true, frozen_base=true, merge_math=true, id_checks=true, param_count=8192",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 75
+  "execution_time_ms": 104
 }

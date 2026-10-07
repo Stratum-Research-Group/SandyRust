@@ -8,8 +8,8 @@
   "implemented_check": "Two-sided finite-difference gradcheck in FP64 across coordinate probes including repeated tokens",
   "prerequisites": "f64 model parameters and forward pass",
   "exclusions": "Single-sided finite differences",
-  "revision": "cb898cc",
-  "dirty_state": false,
+  "revision": "553707d",
+  "dirty_state": true,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo run --release -- verify",
@@ -19,8 +19,8 @@
   "config": "reference_v2",
   "fixture_hash": "g3-repeated-tokens-f64",
   "expected": "finite-difference matches analytic with 0 failures",
-  "observed": "Ok(GradCheckReport { checked: 114, failures: 0, max_abs_err: 6.284789657445833e-9, max_rel_err: 0.0001926368949907955 })",
+  "observed": "Ok(GradCheckReport { checked: 456, failures: 0, max_abs_err: 9.148888296473326e-9, max_rel_err: 0.0031553776282280135 })",
   "tolerance_atol": 0.00001,
   "tolerance_rtol": 0.001,
-  "execution_time_ms": 1478
+  "execution_time_ms": 5685
 }

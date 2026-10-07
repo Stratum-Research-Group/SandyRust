@@ -187,6 +187,16 @@ pub fn sample_next_step(
     if logits.iter().any(|x| !x.is_finite()) {
         return Err(GenerationError::NonFiniteLogits { position });
     }
+    if p.adaptive.is_some() && adaptive_state.is_none() {
+        *adaptive_state = Some(AdaptiveSamplerState::new());
+    }
+    if let (Some(_), Some(state)) = (&p.adaptive, adaptive_state.as_ref()) {
+        if let Some(h) = state.h_ema {
+            if !h.is_finite() {
+                return Err(GenerationError::ControllerNonFinite { step: state.steps });
+            }
+        }
+    }
     if p.temperature == 0.0 {
         // Greedy: bypasses softmax/top-k/top-p and consumes no PRNG state.
         let mut best: Option<usize> = None;
@@ -306,10 +316,14 @@ pub fn sample_next_step(
 
     // Update adaptive state
     if let (Some(cfg), Some(state)) = (&p.adaptive, adaptive_state.as_mut()) {
-        match state.h_ema {
-            None => state.h_ema = Some(h_step),
-            Some(prev) => state.h_ema = Some(cfg.beta * prev + (1.0 - cfg.beta) * h_step),
+        let next_ema = match state.h_ema {
+            None => h_step,
+            Some(prev) => cfg.beta * prev + (1.0 - cfg.beta) * h_step,
+        };
+        if !next_ema.is_finite() {
+            return Err(GenerationError::ControllerNonFinite { step: state.steps });
         }
+        state.h_ema = Some(next_ema);
         state.steps += 1;
     }
 

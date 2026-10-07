@@ -8,7 +8,6 @@ use sandy_rust::gates;
 use sandy_rust::model::Model;
 use sandy_rust::rng::Rng;
 use std::fs;
-use std::path::Path;
 
 #[test]
 fn test_gx15_gate_passes() {
@@ -51,15 +50,15 @@ fn test_x15_analytic_gradients_match_finite_differences() {
         let x: Vec<f32> = (0..d_in).map(|_| rng.next_normal()).collect();
         let dy: Vec<f32> = (0..d_out).map(|_| rng.next_normal()).collect();
 
-        let (d_a_ana, d_b_ana, dx_ana) = mat.backward(&x, &dy);
+        let (d_a_ana, d_b_ana, dx_ana) = mat.backward(&x, &dy).unwrap();
 
         // Check dB
         for i in 0..mat.b.len() {
             let orig = mat.b[i];
             mat.b[i] = orig + eps;
-            let y_p = mat.forward(&x);
+            let y_p = mat.forward(&x).unwrap();
             mat.b[i] = orig - eps;
-            let y_m = mat.forward(&x);
+            let y_m = mat.forward(&x).unwrap();
             mat.b[i] = orig;
 
             let num: f32 = dy.iter().zip(&y_p).zip(&y_m).map(|((&g, &p), &m)| g * (p - m) / (2.0 * eps)).sum();
@@ -70,9 +69,9 @@ fn test_x15_analytic_gradients_match_finite_differences() {
         for i in 0..mat.a.len() {
             let orig = mat.a[i];
             mat.a[i] = orig + eps;
-            let y_p = mat.forward(&x);
+            let y_p = mat.forward(&x).unwrap();
             mat.a[i] = orig - eps;
-            let y_m = mat.forward(&x);
+            let y_m = mat.forward(&x).unwrap();
             mat.a[i] = orig;
 
             let num: f32 = dy.iter().zip(&y_p).zip(&y_m).map(|((&g, &p), &m)| g * (p - m) / (2.0 * eps)).sum();
@@ -85,8 +84,8 @@ fn test_x15_analytic_gradients_match_finite_differences() {
             let mut x_m = x.clone();
             x_p[i] += eps;
             x_m[i] -= eps;
-            let y_p = mat.forward(&x_p);
-            let y_m = mat.forward(&x_m);
+            let y_p = mat.forward(&x_p).unwrap();
+            let y_m = mat.forward(&x_m).unwrap();
 
             let num: f32 = dy.iter().zip(&y_p).zip(&y_m).map(|((&g, &p), &m)| g * (p - m) / (2.0 * eps)).sum();
             assert!((num - dx_ana[i]).abs() < 1e-3, "dx mismatch at index {i} for rank {r}");
@@ -145,7 +144,7 @@ fn test_x15_merge_equivalence() {
 
     let x_t = sandy_rust::tensor::Tensor::from_vec(&[1, cfg.d_model], x.clone()).unwrap();
     let y_base = sandy_rust::tensor::ops::matmul(&x_t, &l_base.wq).unwrap();
-    let y_delta = l_mat.forward(&x);
+    let y_delta = l_mat.forward(&x).unwrap();
 
     let l_merged = &merged_model.layers[0];
     let y_merged = sandy_rust::tensor::ops::matmul(&x_t, &l_merged.wq).unwrap();
@@ -167,7 +166,9 @@ fn test_x15_header_and_tamper_rejection() {
     let targets = [AdapterTarget::Wq];
     let adapter = LoraAdapter::new(&cfg, 2, 4.0, &targets, 111, base_hash, tok_fp).unwrap();
 
-    let path = Path::new("artifacts/.test_tamper_lora.bin");
+    let pid = std::process::id();
+    let path_buf = std::env::temp_dir().join(format!("test_tamper_lora_{pid}.bin"));
+    let path = path_buf.as_path();
     adapter.save(path).unwrap();
 
     // 1. Correct load succeeds
@@ -192,7 +193,8 @@ fn test_x15_header_and_tamper_rejection() {
     let mut bytes = fs::read(path).unwrap();
     let len = bytes.len();
     bytes[len - 1] ^= 0x01; // flip 1 bit in weight payload
-    let corrupt_path = Path::new("artifacts/.test_corrupt_lora.bin");
+    let corrupt_path_buf = std::env::temp_dir().join(format!("test_corrupt_lora_{pid}.bin"));
+    let corrupt_path = corrupt_path_buf.as_path();
     fs::write(corrupt_path, bytes).unwrap();
 
     assert!(matches!(

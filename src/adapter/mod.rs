@@ -113,7 +113,13 @@ impl LoraMatrix {
     }
 
     /// Forward: delta = s * B * (A * x)
-    pub fn forward(&self, x: &[f32]) -> Vec<f32> {
+    pub fn forward(&self, x: &[f32]) -> Result<Vec<f32>, AdapterError> {
+        if x.len() != self.d_in {
+            return Err(AdapterError::ShapeMismatch {
+                expected: vec![self.d_in],
+                actual: vec![x.len()],
+            });
+        }
         let s = self.scale();
         // z = A * x: [r x d_in] * [d_in] -> [r]
         let mut z = vec![0.0f32; self.r];
@@ -136,7 +142,7 @@ impl LoraMatrix {
             }
             out[i] = s * sum;
         }
-        out
+        Ok(out)
     }
 
     /// Compute delta W = s * (B * A)^T as [d_in x d_out] matrix matching SandyRust weights
@@ -157,7 +163,20 @@ impl LoraMatrix {
 
     /// Backward pass for single input x and upstream gradient dy:
     /// Returns (dA, dB, dx_contrib)
-    pub fn backward(&self, x: &[f32], dy: &[f32]) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    #[allow(clippy::type_complexity)]
+    pub fn backward(&self, x: &[f32], dy: &[f32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), AdapterError> {
+        if x.len() != self.d_in {
+            return Err(AdapterError::ShapeMismatch {
+                expected: vec![self.d_in],
+                actual: vec![x.len()],
+            });
+        }
+        if dy.len() != self.d_out {
+            return Err(AdapterError::ShapeMismatch {
+                expected: vec![self.d_out],
+                actual: vec![dy.len()],
+            });
+        }
         let s = self.scale();
         // Forward intermediate: z = A * x [r]
         let mut z = vec![0.0f32; self.r];
@@ -205,7 +224,7 @@ impl LoraMatrix {
             dx[j] = sum;
         }
 
-        (d_a, d_b, dx)
+        Ok((d_a, d_b, dx))
     }
 }
 
@@ -286,6 +305,8 @@ impl LoraAdapter {
         sha256(&bytes)
     }
 
+    pub const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
+
     pub fn save(&self, path: &Path) -> Result<(), AdapterError> {
         let mut data = Vec::new();
         // Magic header
@@ -313,7 +334,28 @@ impl LoraAdapter {
             }
         }
 
-        fs::write(path, data).map_err(|e| AdapterError::Io(e.to_string()))
+        // Atomic write-verify-publish via isolated temporary file in env::temp_dir()
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let temp_path = std::env::temp_dir().join(format!("sandyrust_adapter_{pid}_{nonce}.tmp"));
+        fs::write(&temp_path, &data).map_err(|e| AdapterError::Io(e.to_string()))?;
+
+        let read_back = fs::read(&temp_path).map_err(|e| AdapterError::Io(e.to_string()))?;
+        if read_back != data {
+            let _ = fs::remove_file(&temp_path);
+            return Err(AdapterError::Io("write verification failed".to_string()));
+        }
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::rename(&temp_path, path).map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            AdapterError::Io(e.to_string())
+        })
     }
 
     pub fn load(
@@ -323,6 +365,21 @@ impl LoraAdapter {
         cfg: &Config,
         targets: &[AdapterTarget],
     ) -> Result<Self, AdapterError> {
+        let meta = fs::metadata(path).map_err(|e| AdapterError::Io(e.to_string()))?;
+        if meta.len() as usize > Self::MAX_FILE_SIZE {
+            return Err(AdapterError::Io("adapter file exceeds maximum allowable size (64 MiB)".to_string()));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for &t in targets {
+            if !seen.insert(t) {
+                return Err(AdapterError::UnknownTarget {
+                    layer: 0,
+                    name: format!("duplicate target {:?}", t),
+                });
+            }
+        }
+
         let data = fs::read(path).map_err(|e| AdapterError::Io(e.to_string()))?;
         if data.len() < 10 + 4 + 4 + 4 + 8 + 32 + 32 + 32 || &data[0..10] != b"SANDYLORA1" {
             return Err(AdapterError::BaseMismatch { field: "magic".to_string() });
@@ -339,6 +396,10 @@ impl LoraAdapter {
         offset += 4;
         let alpha = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
         offset += 4;
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err(AdapterError::InvalidAlpha);
+        }
+
         let param_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
         offset += 8;
 
@@ -409,6 +470,10 @@ impl LoraAdapter {
             layers.push(layer_map);
         }
 
+        if offset != data.len() {
+            return Err(AdapterError::BaseMismatch { field: "trailing unparsed bytes".to_string() });
+        }
+
         let adapter = LoraAdapter {
             header: AdapterHeader {
                 schema_version: schema_ver,
@@ -433,6 +498,15 @@ impl LoraAdapter {
 
     /// Merge adapter delta into model weights: W' = W + s * B * A
     pub fn merge(&self, model: &Model) -> Result<Model, AdapterError> {
+        if self.header.base_checkpoint_hash != model.fingerprint() {
+            return Err(AdapterError::BaseMismatch { field: "base_checkpoint_hash".to_string() });
+        }
+        if self.layers.len() != model.layers.len() {
+            return Err(AdapterError::ShapeMismatch {
+                expected: vec![model.layers.len()],
+                actual: vec![self.layers.len()],
+            });
+        }
         let mut updated = model.clone();
         for (l_idx, layer) in self.layers.iter().enumerate() {
             let l_m = &mut updated.layers[l_idx];
@@ -456,6 +530,9 @@ impl LoraAdapter {
                 }
                 for i in 0..w_data.len() {
                     w_data[i] += delta[i];
+                }
+                if w_data.iter().any(|x| !x.is_finite()) {
+                    return Err(AdapterError::NonFiniteAdapter);
                 }
             }
         }
@@ -495,7 +572,7 @@ pub fn gx15() -> crate::gates::GateReport {
     let x_vec: Vec<f32> = (0..d_in).map(|_| rng.next_normal()).collect();
     let dy_vec: Vec<f32> = (0..d_out).map(|_| rng.next_normal()).collect();
 
-    let (d_a_analytic, d_b_analytic, dx_analytic) = lmat.backward(&x_vec, &dy_vec);
+    let (d_a_analytic, d_b_analytic, dx_analytic) = lmat.backward(&x_vec, &dy_vec).unwrap();
 
     // Finite difference for B
     let eps = 1e-4f32;
@@ -503,9 +580,9 @@ pub fn gx15() -> crate::gates::GateReport {
     for i in 0..lmat.b.len() {
         let orig = lmat.b[i];
         lmat.b[i] = orig + eps;
-        let y_plus = lmat.forward(&x_vec);
+        let y_plus = lmat.forward(&x_vec).unwrap();
         lmat.b[i] = orig - eps;
-        let y_minus = lmat.forward(&x_vec);
+        let y_minus = lmat.forward(&x_vec).unwrap();
         lmat.b[i] = orig;
 
         let num_grad: f32 = dy_vec.iter().zip(&y_plus).zip(&y_minus).map(|((&dy, &yp), &ym)| dy * (yp - ym) / (2.0 * eps)).sum();
@@ -520,9 +597,9 @@ pub fn gx15() -> crate::gates::GateReport {
     for i in 0..lmat.a.len() {
         let orig = lmat.a[i];
         lmat.a[i] = orig + eps;
-        let y_plus = lmat.forward(&x_vec);
+        let y_plus = lmat.forward(&x_vec).unwrap();
         lmat.a[i] = orig - eps;
-        let y_minus = lmat.forward(&x_vec);
+        let y_minus = lmat.forward(&x_vec).unwrap();
         lmat.a[i] = orig;
 
         let num_grad: f32 = dy_vec.iter().zip(&y_plus).zip(&y_minus).map(|((&dy, &yp), &ym)| dy * (yp - ym) / (2.0 * eps)).sum();
@@ -539,8 +616,8 @@ pub fn gx15() -> crate::gates::GateReport {
         let mut x_minus = x_vec.clone();
         x_plus[i] += eps;
         x_minus[i] -= eps;
-        let y_plus = lmat.forward(&x_plus);
-        let y_minus = lmat.forward(&x_minus);
+        let y_plus = lmat.forward(&x_plus).unwrap();
+        let y_minus = lmat.forward(&x_minus).unwrap();
 
         let num_grad: f32 = dy_vec.iter().zip(&y_plus).zip(&y_minus).map(|((&dy, &yp), &ym)| dy * (yp - ym) / (2.0 * eps)).sum();
         let ana = dx_analytic[i];
@@ -581,7 +658,7 @@ pub fn gx15() -> crate::gates::GateReport {
                     y_from_delta[i] += test_x[j] * delta_w[j * m.d_out + i];
                 }
             }
-            let y_from_lora = m.forward(&test_x);
+            let y_from_lora = m.forward(&test_x).unwrap();
             for i in 0..m.d_out {
                 if (y_from_delta[i] - y_from_lora[i]).abs() > 1e-5 {
                     merge_math_ok = false;
@@ -591,7 +668,9 @@ pub fn gx15() -> crate::gates::GateReport {
     }
 
     // 5. Identity checks (wrong base hash, wrong rank, corrupted payload)
-    let tmp_file = Path::new("artifacts/.test_adapter.bin");
+    let pid = std::process::id();
+    let tmp_path = std::env::temp_dir().join(format!("gx15_test_adapter_{pid}.bin"));
+    let tmp_file = tmp_path.as_path();
     trained_adapter.save(tmp_file).unwrap();
 
     let wrong_base_hash = [0xffu8; 32];

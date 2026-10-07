@@ -98,7 +98,7 @@ pub fn detect_revision() -> (String, bool) {
             }
         }
     }
-    ("42b86cb".to_string(), false)
+    ("unknown".to_string(), false)
 }
 
 pub fn detect_toolchain() -> String {
@@ -110,7 +110,7 @@ pub fn detect_toolchain() -> String {
             }
         }
     }
-    "rustc 1.82.0+ (std-only)".to_string()
+    "unknown".to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -169,11 +169,12 @@ pub fn g1() -> GateReport {
     let deps = deps.split("\n[").next().unwrap_or("");
     let n = deps.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).count();
     let hash = sha256(manifest.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let build_rs_absent = !std::path::Path::new("build.rs").exists();
     report(
         "G1",
         "integrity",
         t0,
-        n == 0,
+        n == 0 && build_rs_absent,
         "Zero external crate dependencies and zero build.rs scripts (Decision D2-R1, specv3 §1)",
         "Parsed manifest dependency table line count == 0 and verified SHA-256 hash",
         "Rust std library",
@@ -233,7 +234,7 @@ pub fn g3() -> GateReport {
     // Window with repeated tokens to test tied embedding lookup and unembedding head
     let window = [256u32, 65, 66, 65, 257];
     let eps_list = [1e-5, 1e-6, 1e-7];
-    let rep = crate::autodiff::gradcheck(&cfg, &p_f64, &window, &eps_list, 1e-5, 1e-3, 1);
+    let rep = crate::autodiff::gradcheck(&cfg, &p_f64, &window, &eps_list, 1e-5, 1e-3, 4);
     let ok = rep.as_ref().is_ok_and(|r| r.failures == 0);
     report(
         "G3",
@@ -421,6 +422,7 @@ pub fn g8() -> GateReport {
     let mut grads_accum = p0.zeros_like();
     crate::autodiff::loss_and_grad(&cfg, &p0, &w1, denom, &mut grads_accum).unwrap();
     crate::autodiff::loss_and_grad(&cfg, &p0, &w2, denom, &mut grads_accum).unwrap();
+    let unclipped_accum = grads_accum.clone();
     let mut p_accum = p0.clone();
     let mut opt = crate::optimizer::AdamW::new(&p0);
     let step_res = opt.step_with_clipping(&mut p_accum, &mut grads_accum, 1e-3, 1.0).unwrap();
@@ -434,8 +436,21 @@ pub fn g8() -> GateReport {
         let skip_res = opt.update(&mut p_accum, &nan_grads, 1e-3);
         skip_res == Ok(false) && opt.step == prev_step && opt.m == prev_m
     };
+    let mut g1_raw = p0.zeros_like();
+    crate::autodiff::loss_and_grad(&cfg, &p0, &w1, 1.0, &mut g1_raw).unwrap();
+    let mut g2_raw = p0.zeros_like();
+    crate::autodiff::loss_and_grad(&cfg, &p0, &w2, 1.0, &mut g2_raw).unwrap();
+    let mut accum_equiv = true;
+    for ti in 0..p0.data.len() {
+        for j in 0..p0.data[ti].len() {
+            let expected = (g1_raw.data[ti][j] + g2_raw.data[ti][j]) / denom;
+            if (unclipped_accum.data[ti][j] - expected).abs() > 1e-5 {
+                accum_equiv = false;
+            }
+        }
+    }
 
-    let ok = step_res && p_accum.all_finite() && opt.step == 1 && bad_step_ok;
+    let ok = step_res && p_accum.all_finite() && opt.step == 1 && bad_step_ok && accum_equiv;
     report(
         "G8",
         "acceptance",
@@ -514,16 +529,33 @@ pub fn g10() -> GateReport {
     let corpus_hash = [55u8; 32];
     let loader_state = crate::data::LoaderState { position: 10, epoch: 1, corpus_hash, shuffle_seed: 42 };
     let rng = crate::rng::Rng::new(123);
+    let schedule = crate::optimizer::Schedule {
+        eta_max: 0.01,
+        eta_min: 0.001,
+        warmup: 1,
+        max_steps: 10,
+    };
     let trn_state = checkpoint::TrainingState {
         model: m.clone(),
         optimizer: opt,
         loader_state,
         rng_state: rng.dump_state(),
         schedule_step: 3,
+        schedule,
     };
     let trn_bytes = checkpoint::serialize_training(&trn_state);
     let trn_loaded = checkpoint::parse_training(&trn_bytes, &m.cfg, &corpus_hash, DEFAULT_MAX_BYTES);
-    let trn_ok = trn_loaded.is_ok() && trn_loaded.as_ref().unwrap().schedule_step == 3;
+    let trn_ok = if let Ok(ref loaded) = trn_loaded {
+        loaded.schedule_step == trn_state.schedule_step
+            && loaded.optimizer.step == trn_state.optimizer.step
+            && loaded.optimizer.m == trn_state.optimizer.m
+            && loaded.optimizer.v == trn_state.optimizer.v
+            && loaded.rng_state == trn_state.rng_state
+            && loaded.loader_state == trn_state.loader_state
+            && loaded.schedule == trn_state.schedule
+    } else {
+        false
+    };
 
     let ok = bitwise && rejects_corrupt && rejects_trunc && trn_ok;
     report(
@@ -556,7 +588,7 @@ pub fn g11() -> GateReport {
     let shift_ok = doc.windows(2).map(|w| (w[0], w[1])).collect::<Vec<_>>() == [(256, 97), (97, 98), (98, 99), (99, 257)];
 
     // Shard parsing test
-    let temp_rtok = std::env::temp_dir().join("sandy_g11_test.rtok");
+    let temp_rtok = std::env::temp_dir().join(format!("sandy_g11_test_{}_{}.rtok", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
     let test_tokens = vec![256u32, 97, 98, 99, 257];
     crate::data::write_rtok_file(&temp_rtok, &test_tokens, 259, 2).unwrap();
     let mut shard = crate::data::BufferedTokenShard::open(&temp_rtok, 259, 1024).unwrap();
