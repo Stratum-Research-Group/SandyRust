@@ -590,6 +590,8 @@ pub fn gx13() -> GateReport {
     let bounds_caught = matches!(overflow_err, Err(crate::model::ModelError::Hook(HookError::ExportTooLarge { .. })));
 
     let ok = record_parity && zero_parity && patch_parity && bounds_caught;
+    let (rev, dirty) = crate::gates::detect_revision();
+    let toolchain = crate::gates::detect_toolchain();
 
     GateReport {
         gate_id: "GX13",
@@ -600,9 +602,9 @@ pub fn gx13() -> GateReport {
         implemented_check: "Bitwise parity check on disabled/record/zero/patch + bounds checks per §A2.8",
         prerequisites: "Config::reference_v2",
         exclusions: "None",
-        revision: "e7aa4e4",
-        dirty_state: false,
-        toolchain: "rustc 1.98.1",
+        revision: rev,
+        dirty_state: dirty,
+        toolchain,
         target: "x86_64-unknown-linux-gnu",
         command: "cargo test --test test_x13_hooks",
         fixture_hash: hex(&sha256(&base_out.to_le_bytes())),

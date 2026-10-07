@@ -8,9 +8,9 @@
   "implemented_check": "All 256 bytes & UTF-8 roundtrip; y_t = x_{t+1}; .rtok shard header & token streaming validation",
   "prerequisites": "ByteTokenizer, BufferedTokenShard",
   "exclusions": "BPE / subword tokenizers",
-  "revision": "f701506",
+  "revision": "cb898cc",
   "dirty_state": false,
-  "toolchain": "rustc 1.82.0+ (std-only)",
+  "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo run --release -- verify",
   "backend": "cpu_reference",
@@ -22,5 +22,5 @@
   "observed": "bytes=true utf8=true shift=true shard=true",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 0
+  "execution_time_ms": 12
 }

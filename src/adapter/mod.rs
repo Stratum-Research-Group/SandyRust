@@ -612,6 +612,8 @@ pub fn gx15() -> crate::gates::GateReport {
     let count_ok = adapter.header.parameter_count == expected_count;
 
     let ok = zero_init_parity && grad_parity && frozen_base && merge_math_ok && base_mismatch && tok_mismatch && count_ok;
+    let (rev, dirty) = crate::gates::detect_revision();
+    let toolchain = crate::gates::detect_toolchain();
 
     crate::gates::GateReport {
         gate_id: "GX15",
@@ -622,9 +624,9 @@ pub fn gx15() -> crate::gates::GateReport {
         implemented_check: "Zero-init bitwise match + FP64 central diff gradcheck + base immutability + merge delta W check + header integrity",
         prerequisites: "Config::reference_v2",
         exclusions: "None",
-        revision: "1f8b8a8",
-        dirty_state: false,
-        toolchain: "rustc 1.98.1",
+        revision: rev,
+        dirty_state: dirty,
+        toolchain,
         target: "x86_64-unknown-linux-gnu",
         command: "cargo test --test test_x15_lora",
         fixture_hash: hex(&sha256(format!("gx15:params={}:merged={:?}", adapter.header.parameter_count, merged_trained.fingerprint()).as_bytes())),

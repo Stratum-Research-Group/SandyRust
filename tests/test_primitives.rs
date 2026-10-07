@@ -93,3 +93,40 @@ fn batched_matmul_and_reductions() {
     let s1 = sum_axis(&m, 1).unwrap();
     assert_eq!(s1.data(), [6., 15.]);
 }
+
+#[test]
+fn test_masked_softmax_and_attention_mask_length_mismatch() {
+    let mut scores = [1.0, 2.0, 3.0];
+    let valid_short = [true, false];
+    assert!(!masked_softmax_row(&mut scores, &valid_short));
+
+    let q = t(&[2, 2], vec![1., 0., 0., 1.]);
+    let k = t(&[2, 2], vec![1., 0., 0., 1.]);
+    let v = t(&[2, 2], vec![1., 0., 0., 1.]);
+    let err = attention_ref(&q, &k, &v, &[true], &[true, true], 0);
+    assert!(matches!(err, Err(TensorError::InvalidArgument("mask length mismatch"))));
+}
+
+#[test]
+fn test_train_forward_matches_model_forward() {
+    let cfg = sandy_rust::config::Config::reference_v2();
+    let model = sandy_rust::model::Model::init(&cfg).unwrap();
+    let tokens = [256u32, 65, 66, 67, 257];
+
+    let logits_model = model.forward(&tokens, None).unwrap();
+    let p = sandy_rust::autodiff::Params::<f32>::from_model(&model);
+    let out_autodiff = sandy_rust::autodiff::forward_loss(&cfg, &p, &tokens).unwrap();
+
+    let t = tokens.len() - 1;
+    let v = cfg.vocab_size;
+    let mut expected_loss_sum = 0.0f32;
+    for i in 0..t {
+        let target = tokens[i + 1] as usize;
+        let row = &logits_model.data()[i * v..(i + 1) * v];
+        let lse = logsumexp(row);
+        let nll = lse - row[target];
+        expected_loss_sum += nll;
+    }
+    assert!((out_autodiff.loss_sum - expected_loss_sum).abs() < 1e-4);
+    assert_eq!(out_autodiff.n_valid, t);
+}

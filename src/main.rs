@@ -1,10 +1,11 @@
 use sandy_rust::checkpoint::{self, DEFAULT_MAX_BYTES};
 use sandy_rust::config::Config;
+use sandy_rust::data::WindowLoader;
+use sandy_rust::gates;
 use sandy_rust::generation::{generate, SamplingParams};
 use sandy_rust::model::Model;
 use sandy_rust::optimizer::{AdamW, Schedule};
 use sandy_rust::tokenizer::{ByteTokenizer, BOS};
-use sandy_rust::gates;
 use std::{env, fs, path::Path, process::ExitCode, str::FromStr};
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -18,12 +19,92 @@ fn parse_flag<T: FromStr>(args: &[String], name: &str, default: T) -> Result<T, 
     }
 }
 
+type CorpusSplits = (Vec<Vec<u32>>, Vec<Vec<u32>>);
+
+fn load_or_generate_corpus(
+    dataset_path: Option<&str>,
+    vocab_size: usize,
+) -> Result<CorpusSplits, String> {
+    if let Some(path_str) = dataset_path {
+        let p = Path::new(path_str);
+        if path_str.ends_with(".rtok") {
+            let mut shard = sandy_rust::data::BufferedTokenShard::open(p, vocab_size, DEFAULT_MAX_BYTES)
+                .map_err(|e| format!("failed to open .rtok shard: {e:?}"))?;
+            let mut all_tokens = Vec::new();
+            while let Some(tok) = shard.next_token().map_err(|e| format!("shard read error: {e:?}"))? {
+                if tok < 256 {
+                    all_tokens.push(tok);
+                }
+            }
+            if all_tokens.is_empty() {
+                return Err("dataset shard contained no byte tokens < 256".into());
+            }
+            let mut docs = Vec::new();
+            for chunk in all_tokens.chunks(64) {
+                docs.push(chunk.to_vec());
+            }
+            let split_idx = (docs.len() * 4 / 5).max(1);
+            let train_docs = docs[..split_idx].to_vec();
+            let val_docs = if split_idx < docs.len() {
+                docs[split_idx..].to_vec()
+            } else {
+                train_docs.clone()
+            };
+            Ok((train_docs, val_docs))
+        } else {
+            let content = fs::read(p).map_err(|e| format!("failed to read dataset file: {e}"))?;
+            let mut docs = Vec::new();
+            for line in content.split(|&b| b == b'\n') {
+                if !line.is_empty() {
+                    docs.push(line.iter().map(|&b| b as u32).collect());
+                }
+            }
+            if docs.is_empty() {
+                return Err("dataset file was empty".into());
+            }
+            let split_idx = (docs.len() * 4 / 5).max(1);
+            let train_docs = docs[..split_idx].to_vec();
+            let val_docs = if split_idx < docs.len() {
+                docs[split_idx..].to_vec()
+            } else {
+                train_docs.clone()
+            };
+            Ok((train_docs, val_docs))
+        }
+    } else {
+        // Deterministic multi-document synthetic corpus
+        let train_docs = vec![
+            (b"Hello world from SandyRust transformer!".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"Pure Rust autoregressive language model baseline.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"The quick brown fox jumps over the lazy dog.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"Crouzeix ratio constant verification in FP64.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"Zero third-party crate dependencies in R1 std.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"Rotary positional embeddings preserve isometric norms.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"Attention masking isolates padded future query tokens.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"Deterministic state resumption reproduces all moments.".to_vec()).into_iter().map(|b| b as u32).collect(),
+        ];
+        let val_docs = vec![
+            (b"Held-out validation set document number one.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"Testing generalisation on unseen evaluation tokens.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"Bounded cross-entropy loss reduction over epochs.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            (b"Evaluating forward loss on separate loader cursor.".to_vec()).into_iter().map(|b| b as u32).collect(),
+        ];
+        Ok((train_docs, val_docs))
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let cfg = Config::reference_v2();
     match args.first().map(String::as_str) {
         Some("verify") => {
-            let list = flag(&args, "--gates").unwrap_or("g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14");
+            let default_gates = "g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14,gx12e,gx13,gx14,gx15";
+            let list = match flag(&args, "--gates") {
+                Some("all") => default_gates,
+                Some("baseline") => "g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14",
+                Some(custom) => custom,
+                None => default_gates,
+            };
             let ids: Vec<&str> = list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
             let reports = match gates::run(&ids) {
                 Ok(r) => r,
@@ -47,9 +128,9 @@ fn main() -> ExitCode {
 
             for r in &reports {
                 if let Some(reason) = &r.reason {
-                    println!("{:4} [{:<10}] {:<7} ({})", r.gate_id, r.scope, r.status, reason);
+                    println!("{:5} [{:<10}] {:<7} ({})", r.gate_id, r.scope, r.status, reason);
                 } else {
-                    println!("{:4} [{:<10}] {:<7}", r.gate_id, r.scope, r.status);
+                    println!("{:5} [{:<10}] {:<7}", r.gate_id, r.scope, r.status);
                 }
                 match (r.status, r.scope) {
                     ("NOT_RUN", _) => not_run_count += 1,
@@ -96,7 +177,13 @@ fn main() -> ExitCode {
         }
         Some("checkpoint") => {
             if let Some(path) = flag(&args, "--init") {
-                let m = Model::init(&cfg).expect("valid baseline config");
+                let m = match Model::init(&cfg) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("model init error: {e:?}");
+                        return ExitCode::FAILURE;
+                    }
+                };
                 match checkpoint::save(&m, Path::new(path)) {
                     Ok(()) => println!("saved {} params to {path}", m.param_count()),
                     Err(e) => { eprintln!("save failed: {e:?}"); return ExitCode::FAILURE; }
@@ -120,7 +207,13 @@ fn main() -> ExitCode {
                 },
                 None => {
                     eprintln!("note: random-initialised weights (untrained); output is a smoke test only");
-                    Model::init(&cfg).expect("valid baseline config")
+                    match Model::init(&cfg) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("model init error: {e:?}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
                 }
             };
             let tok = ByteTokenizer::new();
@@ -165,7 +258,13 @@ fn main() -> ExitCode {
             }
         }
         Some("gradcheck") => {
-            let m = Model::init(&cfg).expect("model init");
+            let m = match Model::init(&cfg) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("model init error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let p_f64 = sandy_rust::autodiff::Params::<f64>::from_model(&m);
             let window = [256u32, 65, 66, 65, 257];
             println!("Running analytic vs finite-difference gradcheck on reference_v2 (f64)...");
@@ -198,27 +297,93 @@ fn main() -> ExitCode {
                 Ok(v) => v,
                 Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
             };
-            println!("Starting bounded train smoke test: steps={steps}, lr={lr}...");
-            let m = Model::init(&cfg).expect("model init");
+            let val_every: usize = match parse_flag(&args, "--val-every", (steps / 5).max(1)) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+
+            let (train_docs, val_docs) = match load_or_generate_corpus(flag(&args, "--dataset"), cfg.vocab_size) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("dataset error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let mut train_loader = match WindowLoader::new(&train_docs, cfg.max_seq_len, 42) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("train loader error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut val_loader = match WindowLoader::new(&val_docs, cfg.max_seq_len, 1337) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("val loader error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let mut m = match Model::init(&cfg) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("model init error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let mut p = sandy_rust::autodiff::Params::<f32>::from_model(&m);
             let mut opt = AdamW::new(&p);
-            let sched = Schedule { eta_max: lr, eta_min: lr * 0.1, warmup: (steps / 5).max(1) as u64, max_steps: steps as u64 };
-            let train_window = [256u32, 65, 66, 67, 257];
-            let val_window = [256u32, 68, 69, 70, 257];
+            let mut start_step = 1usize;
 
-            for step in 1..=steps {
+            if let Some(resume_path) = flag(&args, "--resume") {
+                let state = match checkpoint::load_training(Path::new(resume_path), &cfg, &train_loader.corpus_hash(), DEFAULT_MAX_BYTES) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("resume error: {e:?}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                m = state.model;
+                p = sandy_rust::autodiff::Params::<f32>::from_model(&m);
+                opt = state.optimizer;
+                if let Err(e) = train_loader.restore(state.loader_state) {
+                    eprintln!("loader restore error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+                start_step = state.schedule_step + 1;
+                println!("Resumed training state from '{resume_path}' at step {start_step}");
+            }
+
+            println!("Starting bounded train: steps={steps}, lr={lr}, start_step={start_step}...");
+            let sched = Schedule { eta_max: lr, eta_min: lr * 0.1, warmup: (steps / 5).max(1) as u64, max_steps: steps as u64 };
+
+            for step in start_step..=steps {
+                let train_window = train_loader.next_window();
                 let mut grads = p.zeros_like();
-                let o = match sandy_rust::autodiff::loss_and_grad(&cfg, &p, &train_window, train_window.len().saturating_sub(1) as f32, &mut grads) {
+                let n_denom = train_window.len().saturating_sub(1) as f32;
+                let o = match sandy_rust::autodiff::loss_and_grad(&cfg, &p, &train_window, n_denom, &mut grads) {
                     Ok(o) => o,
                     Err(e) => { eprintln!("training step {step} error: {e:?}"); return ExitCode::FAILURE; }
                 };
                 let train_loss = o.loss_sum / o.n_valid as f32;
                 let eta = sched.eta(step as u64);
-                if let Err(e) = opt.step_with_clipping(&mut p, &mut grads, eta, 1.0) {
-                    eprintln!("optimizer step {step} error: {e:?}");
-                    return ExitCode::FAILURE;
+                match opt.step_with_clipping(&mut p, &mut grads, eta, 1.0) {
+                    Ok(true) => {},
+                    Ok(false) => {
+                        eprintln!("warning: step {step} skipped due to non-finite gradients (consecutive skips: {})", opt.consecutive_skips);
+                        if opt.consecutive_skips >= 5 {
+                            eprintln!("aborted training: exceeded 5 consecutive gradient skips");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("optimizer step {step} error: {e:?}");
+                        return ExitCode::FAILURE;
+                    }
                 }
-                if step % (steps / 5).max(1) == 0 || step == steps {
+                if step % val_every == 0 || step == steps {
+                    let val_window = val_loader.next_window();
                     let val_out = match sandy_rust::autodiff::forward_loss(&cfg, &p, &val_window) {
                         Ok(l) => l,
                         Err(e) => { eprintln!("eval error: {e:?}"); return ExitCode::FAILURE; }
@@ -227,8 +392,37 @@ fn main() -> ExitCode {
                     println!("step {step:3}/{steps} | train_loss: {train_loss:.4} | val_loss: {val_loss:.4} | lr: {eta:.6}");
                 }
             }
+
+            if let Some(state_path) = flag(&args, "--save-state") {
+                let updated_model = match Model::from_params(&cfg, &p) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("model from params error: {e:?}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let state = sandy_rust::checkpoint::TrainingState {
+                    model: updated_model,
+                    optimizer: opt.clone(),
+                    loader_state: train_loader.state(),
+                    rng_state: ([0u32; 16], [0u32; 16], 0),
+                    schedule_step: steps,
+                };
+                if let Err(e) = checkpoint::save_training(&state, Path::new(state_path)) {
+                    eprintln!("save-state error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+                println!("saved training state to {state_path}");
+            }
+
             if let Some(ckpt_path) = flag(&args, "--checkpoint") {
-                let updated_model = Model::from_params(&cfg, &p).expect("model from params");
+                let updated_model = match Model::from_params(&cfg, &p) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("model from params error: {e:?}");
+                        return ExitCode::FAILURE;
+                    }
+                };
                 if let Err(e) = checkpoint::save(&updated_model, Path::new(ckpt_path)) {
                     eprintln!("checkpoint save error: {e:?}");
                     return ExitCode::FAILURE;
@@ -243,19 +437,43 @@ fn main() -> ExitCode {
             let tok = ByteTokenizer::new();
             let mut prompt_tokens = vec![BOS];
             prompt_tokens.extend(tok.encode_bytes(prompt.as_bytes()));
-            let m = Model::init(&cfg).expect("model init");
+            let m = match Model::init(&cfg) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("model init error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
             match mode {
                 "record" => {
-                    let mut sink = sandy_rust::hooks::ActivationSink::new(sandy_rust::hooks::DEFAULT_MAX_EXPORT_BYTES).unwrap();
+                    let mut sink = match sandy_rust::hooks::ActivationSink::new(sandy_rust::hooks::DEFAULT_MAX_EXPORT_BYTES) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("activation sink error: {e:?}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
                     let ctx = sandy_rust::hooks::HookContext::new().with_record(
                         sandy_rust::hooks::HookId::global(sandy_rust::hooks::HookSite::EmbedOut),
                         sandy_rust::hooks::RecordTiming::PostEdit,
                     );
-                    let out = m.forward_with_hooks(&prompt_tokens, None, Some(&ctx), Some(&mut sink)).expect("forward");
+                    let out = match m.forward_with_hooks(&prompt_tokens, None, Some(&ctx), Some(&mut sink)) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            eprintln!("forward error: {e:?}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
                     println!("Recorded {} activation tensors; logits shape: {:?}", sink.records.len(), out.shape());
                 }
                 "steer" => {
-                    let alpha = parse_flag(&args, "--alpha", 1.0f32).unwrap_or(1.0);
+                    let alpha = match parse_flag(&args, "--alpha", 1.0f32) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("{e}");
+                            return ExitCode::from(2);
+                        }
+                    };
                     let steer_op = sandy_rust::hooks::EditOp::Steer {
                         hook: sandy_rust::hooks::HookId::layer(0, sandy_rust::hooks::HookSite::ResidPre),
                         direction: vec![0.1f32; 128],
@@ -264,7 +482,13 @@ fn main() -> ExitCode {
                         direction_id: "cli_steer".to_string(),
                     };
                     let ctx = sandy_rust::hooks::HookContext::new().with_edit(steer_op);
-                    let out = m.forward_with_hooks(&prompt_tokens, None, Some(&ctx), None).expect("forward");
+                    let out = match m.forward_with_hooks(&prompt_tokens, None, Some(&ctx), None) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            eprintln!("forward error: {e:?}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
                     println!("Steered forward complete with alpha={alpha}; logits shape: {:?}", out.shape());
                 }
                 other => {
@@ -365,8 +589,8 @@ fn main() -> ExitCode {
         _ => {
             eprintln!("usage: sandy_rust <command> [options]");
             eprintln!("commands:");
-            eprintln!("  verify      [--gates g1,g2,...] [--artifacts <dir>]");
-            eprintln!("  train       [--steps n] [--lr f] [--checkpoint path]");
+            eprintln!("  verify      [--gates <list>|all|baseline] [--artifacts <dir>]");
+            eprintln!("  train       [--steps n] [--lr f] [--dataset path] [--save-state path] [--resume path] [--checkpoint path] [--val-every n]");
             eprintln!("  gradcheck");
             eprintln!("  checkpoint  --init <path> | --inspect <path>");
             eprintln!("  generate    [--prompt s] [--max-tokens n] [--temperature t] [--top-k k] [--top-p p] [--seed n] [--checkpoint path]");

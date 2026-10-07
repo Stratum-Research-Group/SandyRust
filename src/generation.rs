@@ -529,6 +529,8 @@ pub fn gx12e() -> crate::gates::GateReport {
     let rep_adapt = compute_repetition_rate(&out_adapt.tokens);
 
     let ok = k0_parity && entropy_fixtures_ok && bounds_ok && err_checks && nan_precedence;
+    let (rev, dirty) = crate::gates::detect_revision();
+    let toolchain = crate::gates::detect_toolchain();
 
     crate::gates::GateReport {
         gate_id: "GX12E",
@@ -539,9 +541,9 @@ pub fn gx12e() -> crate::gates::GateReport {
         implemented_check: "Exact entropy fixtures + controller bounds clamp + k=0.0 bitwise match + typed error validation",
         prerequisites: "Config::reference_v2",
         exclusions: "None",
-        revision: "229080d",
-        dirty_state: false,
-        toolchain: "rustc 1.98.1",
+        revision: rev,
+        dirty_state: dirty,
+        toolchain,
         target: "x86_64-unknown-linux-gnu",
         command: "cargo test --test test_x12e_sampling",
         fixture_hash: crate::sha256::hex(&crate::sha256::sha256(format!("gx12e:fixed={:?}:adapt={:?}", out_fixed.tokens, out_adapt.tokens).as_bytes())),

@@ -11,6 +11,7 @@ pub enum CacheError {
     CapacityExceeded { current: usize, requested: usize, max: usize },
     BindingMismatch(&'static str),
     InterventionMismatch { expected: [u8; 32], actual: [u8; 32] },
+    SessionMismatch { expected: u64, actual: u64 },
     LayerOutOfBounds { layer: usize, total: usize },
     PositionMismatch { expected: usize, actual: usize },
     Tensor(TensorError),
@@ -76,6 +77,17 @@ impl KVCache {
         self
     }
 
+    /// Enforce session identity; cross-session reuse returns CacheError::SessionMismatch
+    pub fn validate_session(&self, expected_session_id: u64) -> Result<(), CacheError> {
+        if self.session_id != expected_session_id {
+            return Err(CacheError::SessionMismatch {
+                expected: expected_session_id,
+                actual: self.session_id,
+            });
+        }
+        Ok(())
+    }
+
     pub fn check_capacity(&self, additional: usize) -> Result<(), CacheError> {
         let total = self.seq_len.checked_add(additional).ok_or(CacheError::CapacityExceeded {
             current: self.seq_len,
@@ -135,6 +147,18 @@ fn slice_cols(t: &Tensor, start: usize, len: usize) -> Result<Tensor, TensorErro
 /// Execute a single incremental decoding step using the contiguous KV cache.
 /// Enforces model identity, transactional rollback on mid-step failure, and exact forward equivalence.
 pub fn forward_step(model: &Model, token: u32, pos: usize, cache: &mut KVCache) -> Result<Tensor, ModelError> {
+    forward_step_with_hooks(model, token, pos, cache, None, None)
+}
+
+/// Execute incremental decoding step enforcing session identity.
+pub fn forward_step_session(
+    model: &Model,
+    token: u32,
+    pos: usize,
+    cache: &mut KVCache,
+    session_id: u64,
+) -> Result<Tensor, ModelError> {
+    cache.validate_session(session_id)?;
     forward_step_with_hooks(model, token, pos, cache, None, None)
 }
 
@@ -500,5 +524,21 @@ mod tests {
         let dummy = vec![0.0f32; kv_dim];
         let res = cache.append_step(0, &dummy, &dummy, cfg.max_seq_len);
         assert!(matches!(res, Err(CacheError::CapacityExceeded { .. })));
+    }
+
+    #[test]
+    fn test_n6_kv_cache_session_validation() {
+        let cfg = Config::reference_v2();
+        let model = Model::init(&cfg).unwrap();
+        let mut cache = KVCache::new(&cfg, model.fingerprint(), 42).unwrap();
+
+        assert!(cache.validate_session(42).is_ok());
+        assert!(matches!(
+            cache.validate_session(999),
+            Err(CacheError::SessionMismatch { expected: 999, actual: 42 })
+        ));
+
+        let res = forward_step_session(&model, 256, 0, &mut cache, 999);
+        assert!(matches!(res, Err(ModelError::Cache(_))));
     }
 }

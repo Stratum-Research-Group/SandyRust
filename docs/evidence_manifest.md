@@ -43,7 +43,7 @@ To prevent evidence inflation and distinguish superficial smoke tests from verif
 | **G7** | `acceptance` | `PASS` | KV cache incremental decode parity & model binding (`§4.1`, `§4.2`) | Stepwise cached logits match full forward row within componentwise 1e-4; stale model rejected | KVCache & Model | Unbound cache reuse |
 | **G8** | `acceptance` | `PASS` | Microbatch gradient accumulation with AdamW clipping & skips (`§8.1`) | Unequal microbatches accumulated, clipped AdamW produces finite weights, NaN grad skipped | AdamW & autodiff | Unchecked NaN grad writes |
 | **G9** | `smoke` | `PASS` | Overfit convergence on synthetic window with 4-layer model (`§8.1`, `G9`) | Full 4-layer `reference_v2` model reduces cross-entropy loss by $\ge 50\%$ in $\le 70$ steps | Full 4-layer autodiff | Multi-epoch corpus training |
-| **G10** | `acceptance` | `PASS` | Deterministic checkpoint & TrainingState resumption (`§8.2`) | Bitwise forward logits parity; corruption/truncation rejected; moments/RNG/loader roundtrip | Checkpoint parser | Inference-only resume |
+| **G10** | `acceptance` | `PASS` | Deterministic checkpoint & TrainingState resumption (`§8.2`) | Bitwise forward logits parity; corruption/truncation rejected; moments/RNG/loader roundtrip tested via G10 and CLI `--save-state`/`--resume` | Checkpoint parser | Inference-only resume |
 | **G11** | `acceptance` | `PASS` | Byte tokenizer roundtrip, next-token shift, buffered shard (`§5.1`, `§5.3`) | All 256 bytes & UTF-8 roundtrip; $y_t = x_{t+1}$; `.rtok` 64-byte header & token streaming | Tokenizer, `.rtok` shard | BPE / subword tokenizers |
 | **G12** | `acceptance` | `PASS` | Deterministic sampling, terminal logit parity, UTF-8 streaming (`§8.3`) | Greedy ignores PRNG; seeded sampling repeats; terminal logits match full forward; UTF-8 buffer | Sampler, UTF-8 buffer | Lossy whole-buffer only decoding |
 | **G13** | `acceptance` | `NOT_RUN` | GPU reference kernel acceleration spike (`§9 G13`) | None (CPU pure-Rust baseline selected under Decision D2-R1) | GPU / CUDA hardware | Decision D2-R1 boundary |
@@ -59,7 +59,7 @@ To prevent evidence inflation and distinguish superficial smoke tests from verif
 
 The verification runner enforces atomic execution:
 1. **EV1 (Set Validation):** All requested gate IDs validated upfront; empty or unrecognized IDs abort with exit code 2. Artifact write failures abort with exit code 1.
-2. **EV2 (Configuration Binding):** Every artifact binds source commit, config identity (`reference_v2`), toolchain, and fixture hashes.
+2. **EV2 (Configuration Binding):** Every artifact dynamically binds source git commit revision (with working-tree dirty detection), config identity (`reference_v2`), active host toolchain (`rustc -V`), and fixture hashes at runtime.
 3. **EV3 (Defect Classification):** Non-finite values and invalid dimensions trigger explicit typed errors rather than silent acceptance. `NOT_RUN` gates remain clearly distinguished from failures.
 4. **EV4 (Tamper Detection):** Cryptographic SHA-256 payload checksums invalidate tampered checkpoints or serialized states.
 5. **EV5 (Scope Separation):** Smoke tests (`G9`) are segregated from full acceptance gates (`G2`–`G5`, `G7`, `G8`, `G10`–`G12`).

@@ -8,9 +8,9 @@
   "implemented_check": "None (CPU pure-Rust baseline selected under Decision D2-R1)",
   "prerequisites": "GPU hardware / CUDA",
   "exclusions": "Decision D2-R1 CPU reference boundary",
-  "revision": "f701506",
+  "revision": "cb898cc",
   "dirty_state": false,
-  "toolchain": "rustc 1.82.0+ (std-only)",
+  "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo run --release -- verify",
   "backend": "cpu_reference",
@@ -22,5 +22,5 @@
   "observed": "N/A",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 0
+  "execution_time_ms": 11
 }

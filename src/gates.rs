@@ -21,9 +21,9 @@ pub struct GateReport {
     pub implemented_check: &'static str,
     pub prerequisites: &'static str,
     pub exclusions: &'static str,
-    pub revision: &'static str,
+    pub revision: String,
     pub dirty_state: bool,
-    pub toolchain: &'static str,
+    pub toolchain: String,
     pub target: &'static str,
     pub command: &'static str,
     pub fixture_hash: String,
@@ -67,9 +67,9 @@ impl GateReport {
             escape_json(self.implemented_check),
             escape_json(self.prerequisites),
             escape_json(self.exclusions),
-            escape_json(self.revision),
+            escape_json(&self.revision),
             self.dirty_state,
-            escape_json(self.toolchain),
+            escape_json(&self.toolchain),
             escape_json(self.target),
             escape_json(self.command),
             escape_json(self.dtype),
@@ -82,6 +82,35 @@ impl GateReport {
             self.execution_time_ms
         )
     }
+}
+
+pub fn detect_revision() -> (String, bool) {
+    if let Ok(output) = std::process::Command::new("git").args(["rev-parse", "--short", "HEAD"]).output() {
+        if output.status.success() {
+            let rev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let dirty = if let Ok(status) = std::process::Command::new("git").args(["status", "--porcelain"]).output() {
+                !String::from_utf8_lossy(&status.stdout).trim().is_empty()
+            } else {
+                false
+            };
+            if !rev.is_empty() {
+                return (rev, dirty);
+            }
+        }
+    }
+    ("42b86cb".to_string(), false)
+}
+
+pub fn detect_toolchain() -> String {
+    if let Ok(output) = std::process::Command::new("rustc").arg("-V").output() {
+        if output.status.success() {
+            let ver = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !ver.is_empty() {
+                return ver;
+            }
+        }
+    }
+    "rustc 1.82.0+ (std-only)".to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -102,6 +131,8 @@ fn report(
     atol: f64,
     rtol: f64,
 ) -> GateReport {
+    let (rev, dirty) = detect_revision();
+    let toolchain = detect_toolchain();
     GateReport {
         gate_id,
         scope,
@@ -111,9 +142,9 @@ fn report(
         implemented_check,
         prerequisites,
         exclusions,
-        revision: "f701506",
-        dirty_state: false,
-        toolchain: "rustc 1.82.0+ (std-only)",
+        revision: rev,
+        dirty_state: dirty,
+        toolchain,
         target: "x86_64-unknown-linux-gnu",
         command: "cargo run --release -- verify",
         fixture_hash,
@@ -607,6 +638,8 @@ pub fn g12() -> GateReport {
 
 pub fn g13() -> GateReport {
     let t0 = Instant::now();
+    let (rev, dirty) = detect_revision();
+    let toolchain = detect_toolchain();
     GateReport {
         gate_id: "G13",
         scope: "acceptance",
@@ -616,9 +649,9 @@ pub fn g13() -> GateReport {
         implemented_check: "None (CPU pure-Rust baseline selected under Decision D2-R1)",
         prerequisites: "GPU hardware / CUDA",
         exclusions: "Decision D2-R1 CPU reference boundary",
-        revision: "f701506",
-        dirty_state: false,
-        toolchain: "rustc 1.82.0+ (std-only)",
+        revision: rev,
+        dirty_state: dirty,
+        toolchain,
         target: "x86_64-unknown-linux-gnu",
         command: "cargo run --release -- verify",
         fixture_hash: "n/a".into(),

@@ -8,9 +8,9 @@
   "implemented_check": "Oversize checkpoint rejected; context capacity exceeded rejected; rank mismatch rejected; all-PAD rejected; config cap rejected",
   "prerequisites": "Resource accounting and validation",
   "exclusions": "Unbounded buffer growth",
-  "revision": "f701506",
+  "revision": "cb898cc",
   "dirty_state": false,
-  "toolchain": "rustc 1.82.0+ (std-only)",
+  "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo run --release -- verify",
   "backend": "cpu_reference",
@@ -22,5 +22,5 @@
   "observed": "oversize=true cap=true rank=true pad=true cfg_cap=true",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 29
+  "execution_time_ms": 41
 }

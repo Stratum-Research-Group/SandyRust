@@ -554,6 +554,8 @@ pub fn gx14() -> GateReport {
     let baselines_ok = baselines.always_flip_selectivity <= 0.0 && baselines.random_selectivity <= 0.0;
 
     let ok = gen_counts_ok && repeat_ok && splits_non_empty && perfect_ok && always_flip_ok && bs_reproducible && baselines_ok;
+    let (rev, dirty) = crate::gates::detect_revision();
+    let toolchain = crate::gates::detect_toolchain();
 
     GateReport {
         gate_id: "GX14",
@@ -564,9 +566,9 @@ pub fn gx14() -> GateReport {
         implemented_check: "Four task generators + family-split leakage test + hand-worked metric tables + bootstrap reproducibility",
         prerequisites: "Config::reference_v2",
         exclusions: "None",
-        revision: "9f8e11e",
-        dirty_state: false,
-        toolchain: "rustc 1.98.1",
+        revision: rev,
+        dirty_state: dirty,
+        toolchain,
         target: "x86_64-unknown-linux-gnu",
         command: "cargo test --test test_x14_eval",
         fixture_hash: hex(&sha256(format!("gx14:families={}:pairs={}", all_fams.len(), all_test_pairs.len()).as_bytes())),

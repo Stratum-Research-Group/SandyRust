@@ -30,11 +30,11 @@ cargo build --release
 ## CLI Usage
 
 ### 1. Quality Acceptance Gates Verification
-Run the verification suite across gates `G1`–`G14`:
+Run the verification suite across all baseline gates and extensions (`G1`–`G14`, `GX12E`–`GX15`), or specify `--gates baseline` for G1–G14:
 ```bash
 cargo run --release -- verify
 ```
-Reports and versioned machine-readable JSON artifacts (schema v3.1) are saved to `artifacts/G*.json`. Detailed coverage is documented in [`docs/evidence_manifest.md`](file:///home/akarta/Projects/SandyRusty/docs/evidence_manifest.md).
+Reports and versioned machine-readable JSON artifacts (schema v3.1) are saved to `artifacts/*.json`. Detailed coverage is documented in [`docs/evidence_manifest.md`](docs/evidence_manifest.md).
 
 ### 2. Autodiff Gradient Verification (Gradcheck)
 Verify reverse-mode autodiff analytic gradients against central finite differences in FP64:
@@ -43,9 +43,9 @@ cargo run --release -- gradcheck
 ```
 
 ### 3. Bounded Training & Evaluation
-Run bounded training steps with cosine schedule, gradient clipping, and held-out validation:
+Run bounded training steps with `WindowLoader`, cosine schedule, gradient clipping, held-out validation, and state saving/resumption:
 ```bash
-cargo run --release -- train --steps 20 --lr 0.01
+cargo run --release -- train --steps 20 --lr 0.01 [--dataset data.rtok] [--save-state state.bin] [--resume state.bin] [--checkpoint model.bin]
 ```
 
 ### 4. Checkpoint Serialization & Inspection
@@ -110,7 +110,7 @@ cargo run --release -- eval flip --task kv_lookup --split test
 
 ## Unsupported Features & Non-Goals
 
-Per Project Decisions ([`docs/decisions.md`](file:///home/akarta/Projects/SandyRusty/docs/decisions.md)):
+Per Project Decisions ([`docs/decisions.md`](docs/decisions.md)):
 
 | Feature | Policy | Rationale |
 | :--- | :--- | :--- |

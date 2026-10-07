@@ -217,18 +217,23 @@ pub struct LoaderState {
 
 #[derive(Debug, Clone)]
 pub struct WindowLoader {
+    t: usize,
     windows: Vec<Vec<u32>>,
     order: Vec<usize>,
     state: LoaderState,
     corpus_hash: [u8; 32],
 }
 
-fn compute_corpus_hash(docs: &[Vec<u32>]) -> [u8; 32] {
+fn compute_corpus_hash(docs: &[Vec<u32>], t: usize, bos: u32, eos: u32, pad: u32) -> [u8; 32] {
     let mut b = Vec::new();
+    b.extend_from_slice(&(t as u64).to_le_bytes());
+    b.extend_from_slice(&bos.to_le_bytes());
+    b.extend_from_slice(&eos.to_le_bytes());
+    b.extend_from_slice(&pad.to_le_bytes());
     for doc in docs {
         b.extend_from_slice(&(doc.len() as u64).to_le_bytes());
-        for &t in doc {
-            b.extend_from_slice(&t.to_le_bytes());
+        for &tok in doc {
+            b.extend_from_slice(&tok.to_le_bytes());
         }
     }
     sha256(&b)
@@ -257,7 +262,7 @@ impl WindowLoader {
                 }
             }
         }
-        let chash = compute_corpus_hash(docs);
+        let chash = compute_corpus_hash(docs, t, BOS, EOS, PAD);
         let mut windows = Vec::new();
         for doc in docs {
             let mut tok = Vec::with_capacity(doc.len().checked_add(2).ok_or(TrainError::Data("doc length overflow"))?);
@@ -279,6 +284,7 @@ impl WindowLoader {
         }
         let order = shuffled(windows.len(), seed, 0);
         Ok(WindowLoader {
+            t,
             windows,
             order,
             state: LoaderState {
@@ -289,6 +295,10 @@ impl WindowLoader {
             },
             corpus_hash: chash,
         })
+    }
+
+    pub fn t(&self) -> usize {
+        self.t
     }
 
     pub fn len(&self) -> usize {
@@ -363,6 +373,10 @@ mod tests {
         assert!(b.restore(LoaderState { corpus_hash: a.corpus_hash(), epoch: 0, position: 999, shuffle_seed: 42 }).is_err());
         // Different corpus rejected
         assert!(b.restore(LoaderState { corpus_hash: [0u8; 32], epoch: 0, position: 0, shuffle_seed: 42 }).is_err());
+
+        // N3 regression: restoring state from t=8 into loader with t=16 over identical docs must be rejected
+        let mut loader_t16 = WindowLoader::new(&docs(), 16, 42).unwrap();
+        assert!(loader_t16.restore(st).is_err(), "Restoring state from different window length must fail");
     }
 
     #[test]
