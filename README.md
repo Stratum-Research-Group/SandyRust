@@ -75,6 +75,16 @@ cargo run --release -- inspect --prompt "Hello world" --mode record
 cargo run --release -- inspect --prompt "Hello world" --mode steer --alpha 2.0
 ```
 
+### 7. Paired Perturbation & Flip-Rate Evaluation (X14)
+Run paired perturbation semantic flip-rate evaluation across synthetic tasks:
+```bash
+# Evaluate across all 4 synthetic tasks with family-clustered bootstrap
+cargo run --release -- eval flip --task all --split test
+
+# Target a specific task generator
+cargo run --release -- eval flip --task kv_lookup --split test
+```
+
 ## Quality Acceptance Gates
 
 | Gate | Scope | Title | Description | Status |
@@ -94,6 +104,7 @@ cargo run --release -- inspect --prompt "Hello world" --mode steer --alpha 2.0
 | **G13** | `acceptance` | **GPU Spike** | Optional GPU spike deferred under CPU baseline | **NOT RUN** (D2-R1) |
 | **G14** | `regression` | **Failure Mode Handling** | Oversized checkpoints, capacity overflows, and rank errors rejected safely | **PASS** |
 | **GX13** | `acceptance` | **Activation Hooks & Steering** | Zero-overhead Off mode; bitwise record/patch parity; bounded steering | **PASS** |
+| **GX14** | `acceptance` | **Paired Perturbation & Flip-Rate** | 4 synthetic task generators; 0% split leakage; exact hand-worked metrics; reproducible bootstrap | **PASS** |
 
 ## Unsupported Features & Non-Goals
 

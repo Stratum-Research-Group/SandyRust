@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "generators": [
+    "kv_lookup:v1",
+    "copy_marker:v1",
+    "digit_comparison:v1",
+    "symbol_count:v1"
+  ],
+  "split_seed": 42,
+  "bootstrap_seed": 1337,
+  "min_test_families": 30,
+  "resample_count": 2000,
+  "min_selectivity_threshold": 0.20
+}

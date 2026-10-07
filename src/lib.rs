@@ -5,6 +5,7 @@ pub mod cache;
 pub mod checkpoint;
 pub mod config;
 pub mod data;
+pub mod eval;
 pub mod gates;
 pub mod generation;
 pub mod hooks;

@@ -49,6 +49,7 @@ To prevent evidence inflation and distinguish superficial smoke tests from verif
 | **G13** | `acceptance` | `NOT_RUN` | GPU reference kernel acceleration spike (`§9 G13`) | None (CPU pure-Rust baseline selected under Decision D2-R1) | GPU / CUDA hardware | Decision D2-R1 boundary |
 | **G14** | `regression` | `PASS` | Resource caps, bounded allocation, and typed error safety (`§2.2`, `§8.2`) | Oversize checkpoint rejected; context overflow rejected; rank error rejected; all-PAD rejected | Resource accounting | Unbounded buffer growth |
 | **GX13** | `acceptance` | `PASS` | Activation hooks, inspectability & bounded steering (`Addendum A1 §A2`) | Bitwise match on disabled/record/zero/patch; export caps; cache intervention policy hash | `Config::reference_v2` | Training-time steering |
+| **GX14** | `acceptance` | `PASS` | Paired perturbation & semantic flip-rate evaluation (`Addendum A1 §A3`) | Deterministic generators, 0% split prompt leakage, hand-worked metrics parity, bootstrap reproducibility, trivial baselines | `Config::reference_v2` | Model training dependencies |
 
 ---
 
@@ -85,6 +86,17 @@ cargo run --release -- gradcheck
 ### Bounded Reference Training Run
 ```bash
 cargo run --release -- train --steps 20 --lr 0.01
+```
+
+### Activation Inspection & Steering (X13)
+```bash
+cargo run --release -- inspect --prompt "Hello" --mode record
+cargo run --release -- inspect --prompt "Hello" --mode steer --alpha 1.5
+```
+
+### Paired Perturbation & Semantic Flip-Rate Evaluation (X14)
+```bash
+cargo run --release -- eval flip --task all --split test
 ```
 
 ### Complete Test Suite (Unit, Integration, Evidence, and Mathematical Fixtures)

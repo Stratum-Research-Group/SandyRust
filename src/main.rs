@@ -273,6 +273,94 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Some("eval") => {
+            let sub = args.get(1).map(String::as_str);
+            match sub {
+                Some("flip") => {
+                    let task = flag(&args, "--task").unwrap_or("all");
+                    let split = flag(&args, "--split").unwrap_or("test");
+                    println!("Running Paired Perturbation & Flip-Rate Evaluation (task: {task}, split: {split})...");
+
+                    let mut families = Vec::new();
+                    if task == "all" || task == "kv_lookup" {
+                        families.extend(sandy_rust::eval::generate_kv_lookup(100, 42));
+                    }
+                    if task == "all" || task == "copy_marker" {
+                        families.extend(sandy_rust::eval::generate_copy_marker(100, 43));
+                    }
+                    if task == "all" || task == "digit_comparison" {
+                        families.extend(sandy_rust::eval::generate_digit_comparison(100, 44));
+                    }
+                    if task == "all" || task == "symbol_count" {
+                        families.extend(sandy_rust::eval::generate_symbol_count(100, 45));
+                    }
+
+                    let (train_f, dev_f, test_f) = match sandy_rust::eval::assign_splits(&families, 1337) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("split assignment error: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+
+                    let target_families = match split {
+                        "train" => train_f,
+                        "dev" => dev_f,
+                        "test" => test_f,
+                        _ => {
+                            eprintln!("invalid split '{split}'; expected train, dev, or test");
+                            return ExitCode::from(2);
+                        }
+                    };
+
+                    let pairs: Vec<&sandy_rust::eval::Pair> = target_families.iter().flat_map(|f| &f.pairs).collect();
+                    println!("Evaluated {} families, {} pairs on split '{}'", target_families.len(), pairs.len(), split);
+
+                    let oracle_preds: Vec<(&sandy_rust::eval::Pair, sandy_rust::eval::PredictionResult)> = pairs.iter().map(|p| {
+                        (*p, sandy_rust::eval::PredictionResult {
+                            model_base_answer: p.oracle_base_answer.clone(),
+                            model_variant_answer: p.oracle_variant_answer.clone(),
+                        })
+                    }).collect();
+
+                    let (flip_mf, flip_mnf, selectivity, base_acc, var_acc) = match sandy_rust::eval::evaluate_pairs(&oracle_preds) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("metrics computation error: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+
+                    let ci = match sandy_rust::eval::family_clustered_bootstrap(&target_families, &oracle_preds, 2000, 20261007) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("bootstrap error: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+
+                    let baselines = sandy_rust::eval::evaluate_trivial_baselines(&pairs);
+
+                    println!("--- Metrics (Oracle Reference) ---");
+                    println!("Base Accuracy:       {:.2}%", base_acc * 100.0);
+                    println!("Variant Accuracy:    {:.2}%", var_acc * 100.0);
+                    println!("Must-Flip Flip Rate: {:.2}%", flip_mf * 100.0);
+                    println!("Must-Not-Flip Rate:  {:.2}%", flip_mnf * 100.0);
+                    println!("Selectivity:         {:.4}", selectivity);
+                    println!("Selectivity 95% CI:  [{:.4}, {:.4}]", ci.lower, ci.upper);
+                    println!("--- Trivial Baselines Selectivity ---");
+                    println!("Always Flip:         {:.4}", baselines.always_flip_selectivity);
+                    println!("Always Same:         {:.4}", baselines.always_same_selectivity);
+                    println!("Random:              {:.4}", baselines.random_selectivity);
+
+                    ExitCode::SUCCESS
+                }
+                _ => {
+                    eprintln!("usage: sandy_rust eval flip [--task all|kv_lookup|copy_marker|digit_comparison|symbol_count] [--split train|dev|test]");
+                    ExitCode::from(2)
+                }
+            }
+        }
         _ => {
             eprintln!("usage: sandy_rust <command> [options]");
             eprintln!("commands:");
@@ -282,6 +370,7 @@ fn main() -> ExitCode {
             eprintln!("  checkpoint  --init <path> | --inspect <path>");
             eprintln!("  generate    [--prompt s] [--max-tokens n] [--temperature t] [--top-k k] [--top-p p] [--seed n] [--checkpoint path]");
             eprintln!("  inspect     [--prompt s] [--mode record|steer] [--alpha f]");
+            eprintln!("  eval flip   [--task <name>] [--split <name>]");
             ExitCode::from(2)
         }
     }
