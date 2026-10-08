@@ -85,6 +85,22 @@ cargo run --release -- eval flip --task all --split test
 cargo run --release -- eval flip --task kv_lookup --split test
 ```
 
+### 8. External Pretrained Weight Import (X17)
+Inspect, convert, and run inference on external LLaMA-family safetensors models (e.g. SmolLM2-135M) using pure-Rust standard-library-only converters and BPE tokenizers:
+```bash
+# Inspect safetensors header and tensor inventory without loading weights into RAM
+cargo run --release -- import-inspect --model-dir ./smollm2-135m
+
+# Import weights, remap layout/RoPE, and serialize RIMP checkpoint + manifest
+cargo run --release -- import --model-dir ./smollm2-135m --out models/smollm2_135m.rimp
+
+# Generate tokens with imported model and HuggingFace BPE tokenizer
+cargo run --release -- generate --import models/smollm2_135m.rimp --tokenizer ./smollm2-135m/tokenizer.json --prompt "The quick brown fox"
+
+# Verify logit and greedy continuation parity against offline reference fixture
+cargo run --release -- import-parity --import models/smollm2_135m.rimp --fixture fixtures/x17_smollm2_135m.json
+```
+
 ## Quality Acceptance Gates
 
 | Gate | Scope | Title | Description | Status |
@@ -107,6 +123,7 @@ cargo run --release -- eval flip --task kv_lookup --split test
 | **GX13** | `acceptance` | **Activation Hooks & Steering** | Zero-overhead Off mode; bitwise record/patch parity; bounded steering | **PASS** |
 | **GX14** | `acceptance` | **Paired Perturbation & Flip-Rate** | 4 synthetic task generators; 0% split leakage; exact hand-worked metrics; reproducible bootstrap | **PASS** |
 | **GX15** | `acceptance` | **FP32 LoRA (Parameter-Efficient)** | Zero-init bitwise match; analytic gradcheck; base immutability; weight merge equivalence | **PASS** |
+| **GX17** | `acceptance` | **External Weight Import** | Safetensors reader, RIMP format, dtype conversion, RoPE permutation, BPE tokenizer, memory caps, generation smoke | **PASS** |
 
 ## Unsupported Features & Non-Goals
 
@@ -114,7 +131,7 @@ Per Project Decisions ([`docs/decisions.md`](docs/decisions.md)):
 
 | Feature | Policy | Rationale |
 | :--- | :--- | :--- |
-| External Pretrained Weights | Unsupported | Model is trained from scratch with deterministic seeded initialization (D6) |
+| External Pretrained Weights | Supported (X17) | Baseline remains random-init scratch training (D6-R1); optional X17 imports weights into an isolated profile |
 | Third-Party Crates | Unsupported | Strict pure-Rust standard library implementation (D2-R1) |
 | GPU Execution | Unsupported | Strict CPU pure Rust execution profile (D2-R1) |
-| Extensions `X1`–`X16`, `X12-E` | Disabled | Modular extensions remain disabled in baseline; evaluated in Phase 6 |
+| Extensions `X1`–`X17` | Modular | All extensions are modular and leave the baseline model untouched; G1–G14 pass independently |
