@@ -198,6 +198,66 @@ fn main() -> ExitCode {
             );
             if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
         }
+        Some("import") => {
+            let model_dir = match flag(&args, "--model-dir") {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    eprintln!("missing required flag --model-dir");
+                    return ExitCode::from(2);
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let out_path_str = match flag(&args, "--out") {
+                Ok(Some(o)) => o,
+                Ok(None) => {
+                    eprintln!("missing required flag --out");
+                    return ExitCode::from(2);
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let out_path = Path::new(out_path_str);
+            if out_path.exists() {
+                eprintln!("error: refusing to overwrite existing file '{}'", out_path.display());
+                return ExitCode::FAILURE;
+            }
+
+            println!("Importing model from '{model_dir}'...");
+            let (model, manifest) = match sandy_rust::import::import_model(Path::new(model_dir), None) {
+                Ok((m, mf)) => (m, mf),
+                Err(e) => {
+                    eprintln!("import error: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let manifest_text = manifest.canonical_text();
+            let manifest_path = out_path.with_extension("manifest");
+            if manifest_path.exists() {
+                eprintln!("error: refusing to overwrite existing manifest file '{}'", manifest_path.display());
+                return ExitCode::FAILURE;
+            }
+
+            if let Err(e) = sandy_rust::import::save_rimp(out_path, &model, manifest.fingerprint(), [0u8; 32]) {
+                eprintln!("failed to save RIMP checkpoint: {e:?}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(e) = fs::write(&manifest_path, &manifest_text) {
+                eprintln!("failed to write manifest: {e}");
+                return ExitCode::FAILURE;
+            }
+
+            println!("Successfully imported model: {} params", model.param_count());
+            println!("  RIMP checkpoint: {}", out_path.display());
+            println!("  Manifest:        {}", manifest_path.display());
+            println!("  SPDX License:    {}", manifest.source_license_spdx);
+            ExitCode::SUCCESS
+        }
         Some("checkpoint") => {
             let init_path = match flag(&args, "--init") {
                 Ok(v) => v,
@@ -709,6 +769,7 @@ fn main() -> ExitCode {
             eprintln!("usage: sandy_rust <command> [options]");
             eprintln!("commands:");
             eprintln!("  verify      [--gates <list>|all|baseline] [--artifacts <dir>]");
+            eprintln!("  import      --model-dir <dir> --out <file.rimp>");
             eprintln!("  train       [--steps n] [--lr f] [--dataset path] [--save-state path] [--resume path] [--checkpoint path] [--val-every n]");
             eprintln!("  gradcheck");
             eprintln!("  checkpoint  --init <path> | --inspect <path>");

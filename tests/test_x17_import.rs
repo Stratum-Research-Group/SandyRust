@@ -261,3 +261,89 @@ fn test_rimp_serialize_deserialize_roundtrip() {
     assert_eq!(out_orig.data(), out_loaded.data());
 }
 
+#[test]
+fn test_permute_rope_rows_and_transpose_2d() {
+    let dh = 4;
+    let n_heads = 1;
+    let d_in = 2;
+    // Input matrix [4, 2]:
+    // row 0: [1, 2]  (HF k=0, first half)
+    // row 1: [3, 4]  (HF k=1, first half)
+    // row 2: [5, 6]  (HF k=0, second half)
+    // row 3: [7, 8]  (HF k=1, second half)
+    let raw = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let perm = sandy_rust::import::permute_rope_rows(&raw, n_heads, dh, d_in);
+    // Sandy adjacent pairs:
+    // row 0 (2*0 = 0) gets old row 0: [1, 2]
+    // row 1 (2*0+1 = 1) gets old row 2: [5, 6]
+    // row 2 (2*1 = 2) gets old row 1: [3, 4]
+    // row 3 (2*1+1 = 3) gets old row 3: [7, 8]
+    assert_eq!(perm, vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+
+    // Transpose [4, 2] to [2, 4]:
+    let trans = sandy_rust::import::transpose_2d(&perm, 4, 2);
+    // Row 0 of trans: [1.0, 5.0, 3.0, 7.0]
+    // Row 1 of trans: [2.0, 6.0, 4.0, 8.0]
+    assert_eq!(trans, vec![1.0, 5.0, 3.0, 7.0, 2.0, 6.0, 4.0, 8.0]);
+}
+
+#[test]
+fn test_synthetic_llama_import_parity() {
+    let (config_json, safetensors_bytes) = sandy_rust::import::build_synthetic_llama_safetensors();
+    let model = sandy_rust::import::remap_safetensors_from_bytes(
+        config_json.as_bytes(),
+        &safetensors_bytes,
+        Some(16),
+    ).unwrap();
+
+    assert_eq!(model.cfg.d_model, 8);
+    assert_eq!(model.cfg.n_layers, 2);
+    assert_eq!(model.cfg.n_q_heads, 2);
+    assert_eq!(model.cfg.n_kv_heads, 1);
+    assert!(model.cfg.tied_embeddings);
+
+    // Forward pass
+    let prompt = [0u32, 1, 2];
+    let out = model.forward(&prompt, None).unwrap();
+    assert_eq!(out.shape(), &[3, 16]);
+    assert!(out.data().iter().all(|x| x.is_finite()));
+}
+
+#[test]
+fn test_negative_mapping_rejections() {
+    let (config_json, mut safetensors_bytes) = sandy_rust::import::build_synthetic_llama_safetensors();
+
+    // 1. Bias rejection
+    let bad_bias_header = r#"{"model.layers.0.self_attn.q_proj.bias":{"dtype":"F32","shape":[8],"data_offsets":[0,32]}}"#;
+    let bad_bias_file = sandy_rust::import::build_safetensors_bytes(bad_bias_header, &[0u8; 32], 8);
+    let res = sandy_rust::import::remap_safetensors_from_bytes(config_json.as_bytes(), &bad_bias_file, Some(16));
+    assert!(matches!(res, Err(sandy_rust::import::ImportError::UnsupportedArchitecture(_))));
+
+    // 2. Q-norm / K-norm rejection
+    let bad_qnorm_header = r#"{"model.layers.0.self_attn.q_norm.weight":{"dtype":"F32","shape":[8],"data_offsets":[0,32]}}"#;
+    let bad_qnorm_file = sandy_rust::import::build_safetensors_bytes(bad_qnorm_header, &[0u8; 32], 8);
+    let res = sandy_rust::import::remap_safetensors_from_bytes(config_json.as_bytes(), &bad_qnorm_file, Some(16));
+    assert!(matches!(res, Err(sandy_rust::import::ImportError::UnsupportedArchitecture(_))));
+
+    // 3. Unknown tensor rejection
+    let unknown_header = r#"{"some_unknown_tensor":{"dtype":"F32","shape":[8],"data_offsets":[0,32]}}"#;
+    let unknown_file = sandy_rust::import::build_safetensors_bytes(unknown_header, &[0u8; 32], 8);
+    let res = sandy_rust::import::remap_safetensors_from_bytes(config_json.as_bytes(), &unknown_file, Some(16));
+    assert!(matches!(res, Err(sandy_rust::import::ImportError::UnknownTensor(_))));
+
+    // 4. Missing required tensor rejection
+    let empty_header = r#"{}"#;
+    let empty_file = sandy_rust::import::build_safetensors_bytes(empty_header, &[], 8);
+    let res = sandy_rust::import::remap_safetensors_from_bytes(config_json.as_bytes(), &empty_file, Some(16));
+    assert!(matches!(res, Err(sandy_rust::import::ImportError::MissingTensor(_))));
+
+    // 5. Non-finite weight rejection
+    // Inject NaN into safetensors payload (after 8 bytes len + N header bytes)
+    let header_len = u64::from_le_bytes(safetensors_bytes[..8].try_into().unwrap()) as usize;
+    let nan_bytes = f32::NAN.to_le_bytes();
+    safetensors_bytes[8 + header_len..8 + header_len + 4].copy_from_slice(&nan_bytes);
+    let res = sandy_rust::import::remap_safetensors_from_bytes(config_json.as_bytes(), &safetensors_bytes, Some(16));
+    assert!(matches!(res, Err(sandy_rust::import::ImportError::NonFinite { .. })));
+}
+
+

@@ -561,6 +561,7 @@ pub struct TensorInfo {
 pub struct SafetensorsHeader {
     pub tensors: Vec<TensorInfo>,
     pub metadata: Option<Vec<(String, String)>>,
+    pub header_size: usize,
 }
 
 /// Parse and strictly validate a safetensors byte buffer.
@@ -829,7 +830,7 @@ pub fn parse_safetensors_header(bytes: &[u8]) -> Result<SafetensorsHeader, Impor
         }
     }
 
-    Ok(SafetensorsHeader { tensors, metadata })
+    Ok(SafetensorsHeader { tensors, metadata, header_size: n as usize })
 }
 
 /// Read a safetensors file from disk under security and profile size limits.
@@ -1546,6 +1547,334 @@ pub fn inspect_model_dir(dir: &Path) -> Result<ModelInspection, ImportError> {
 }
 
 // ---------------------------------------------------------------------------
+// Tensor Name and Layout Mappings (§B6, Phase I3)
+// ---------------------------------------------------------------------------
+
+/// Permute rows of a 2D weight matrix from HuggingFace half-split RoPE to SandyRust adjacent-pair RoPE.
+/// For each head `h in 0..n_heads`, and each frequency `k in 0..dh/2`:
+/// - `new_row[2*k] = old_row[k]`
+/// - `new_row[2*k + 1] = old_row[k + dh/2]`
+pub fn permute_rope_rows(data: &[f32], n_heads: usize, dh: usize, d_in: usize) -> Vec<f32> {
+    let rows = n_heads * dh;
+    let mut out = vec![0.0f32; rows * d_in];
+    let half = dh / 2;
+    for h in 0..n_heads {
+        let head_base = h * dh;
+        for k in 0..half {
+            let old_r0 = (head_base + k) * d_in;
+            let old_r1 = (head_base + k + half) * d_in;
+            let new_r0 = (head_base + 2 * k) * d_in;
+            let new_r1 = (head_base + 2 * k + 1) * d_in;
+
+            out[new_r0..new_r0 + d_in].copy_from_slice(&data[old_r0..old_r0 + d_in]);
+            out[new_r1..new_r1 + d_in].copy_from_slice(&data[old_r1..old_r1 + d_in]);
+        }
+    }
+    out
+}
+
+/// Transpose a row-major 2D matrix of shape `[rows, cols]` to `[cols, rows]`.
+pub fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
+/// Remap parsed HuggingFace LLaMA safetensors to a SandyRust `Model` per §B6.
+pub fn remap_safetensors_to_model(
+    header: &SafetensorsHeader,
+    data_buffer: &[u8],
+    cfg: &Config,
+) -> Result<Model, ImportError> {
+    // 1. Whitelist validation and rejection of unsupported features (§B6, §B7.6)
+    let dh = cfg.head_dim();
+    let mut expected_names = std::collections::HashSet::new();
+    expected_names.insert("model.embed_tokens.weight".to_string());
+    for i in 0..cfg.n_layers {
+        expected_names.insert(format!("model.layers.{i}.input_layernorm.weight"));
+        expected_names.insert(format!("model.layers.{i}.self_attn.q_proj.weight"));
+        expected_names.insert(format!("model.layers.{i}.self_attn.k_proj.weight"));
+        expected_names.insert(format!("model.layers.{i}.self_attn.v_proj.weight"));
+        expected_names.insert(format!("model.layers.{i}.self_attn.o_proj.weight"));
+        expected_names.insert(format!("model.layers.{i}.post_attention_layernorm.weight"));
+        expected_names.insert(format!("model.layers.{i}.mlp.gate_proj.weight"));
+        expected_names.insert(format!("model.layers.{i}.mlp.up_proj.weight"));
+        expected_names.insert(format!("model.layers.{i}.mlp.down_proj.weight"));
+    }
+    expected_names.insert("model.norm.weight".to_string());
+    expected_names.insert("lm_head.weight".to_string());
+
+    for t in &header.tensors {
+        if t.name.ends_with(".bias") {
+            return Err(ImportError::UnsupportedArchitecture(format!(
+                "bias tensors are unsupported: {}",
+                t.name
+            )));
+        }
+        if t.name.contains("q_norm") || t.name.contains("k_norm") {
+            return Err(ImportError::UnsupportedArchitecture(format!(
+                "q_norm/k_norm are unsupported: {}",
+                t.name
+            )));
+        }
+        if t.name.ends_with(".rotary_emb.inv_freq") || t.name == "rotary_emb.inv_freq" {
+            continue; // allowed in ignore list
+        }
+        if !expected_names.contains(&t.name) {
+            return Err(ImportError::UnknownTensor(t.name.clone()));
+        }
+    }
+
+    // Helper to extract and decode a tensor by name
+    let get_tensor = |name: &str, expected_shape: &[usize]| -> Result<Vec<f32>, ImportError> {
+        let entry = header
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| ImportError::MissingTensor(name.to_string()))?;
+        if entry.shape != expected_shape {
+            return Err(ImportError::ShapeMismatch {
+                name: name.to_string(),
+                expected: expected_shape.to_vec(),
+                actual: entry.shape.clone(),
+            });
+        }
+        let (start, end) = entry.data_offsets;
+        if end > data_buffer.len() || start > end {
+            return Err(ImportError::OffsetOutOfBounds {
+                name: name.to_string(),
+            });
+        }
+        let slice = &data_buffer[start..end];
+        decode_tensor_f32(entry.dtype, slice, name)
+    };
+
+    // 2. Map tensors in the exact inventory() order
+    let mut tensors = Vec::new();
+
+    // embed [vocab_size, d_model]
+    let embed_floats = get_tensor("model.embed_tokens.weight", &[cfg.vocab_size, cfg.d_model])?;
+    tensors.push(
+        Tensor::from_vec(&[cfg.vocab_size, cfg.d_model], embed_floats.clone())
+            .map_err(|e| ImportError::BadShape { name: format!("embed: {e:?}") })?,
+    );
+
+    // Layers 0..n_layers
+    for i in 0..cfg.n_layers {
+        // rms1 [d_model]
+        let rms1_name = format!("model.layers.{i}.input_layernorm.weight");
+        let rms1_floats = get_tensor(&rms1_name, &[cfg.d_model])?;
+        tensors.push(
+            Tensor::from_vec(&[cfg.d_model], rms1_floats)
+                .map_err(|e| ImportError::BadShape { name: format!("{rms1_name}: {e:?}") })?,
+        );
+
+        // wq [d_model, n_q_heads * dh]
+        let q_name = format!("model.layers.{i}.self_attn.q_proj.weight");
+        let q_hf = get_tensor(&q_name, &[cfg.n_q_heads * dh, cfg.d_model])?;
+        let q_perm = permute_rope_rows(&q_hf, cfg.n_q_heads, dh, cfg.d_model);
+        let q_trans = transpose_2d(&q_perm, cfg.n_q_heads * dh, cfg.d_model);
+        tensors.push(
+            Tensor::from_vec(&[cfg.d_model, cfg.n_q_heads * dh], q_trans)
+                .map_err(|e| ImportError::BadShape { name: format!("{q_name}: {e:?}") })?,
+        );
+
+        // wk [d_model, n_kv_heads * dh]
+        let k_name = format!("model.layers.{i}.self_attn.k_proj.weight");
+        let k_hf = get_tensor(&k_name, &[cfg.n_kv_heads * dh, cfg.d_model])?;
+        let k_perm = permute_rope_rows(&k_hf, cfg.n_kv_heads, dh, cfg.d_model);
+        let k_trans = transpose_2d(&k_perm, cfg.n_kv_heads * dh, cfg.d_model);
+        tensors.push(
+            Tensor::from_vec(&[cfg.d_model, cfg.n_kv_heads * dh], k_trans)
+                .map_err(|e| ImportError::BadShape { name: format!("{k_name}: {e:?}") })?,
+        );
+
+        // wv [d_model, n_kv_heads * dh]
+        let v_name = format!("model.layers.{i}.self_attn.v_proj.weight");
+        let v_hf = get_tensor(&v_name, &[cfg.n_kv_heads * dh, cfg.d_model])?;
+        let v_trans = transpose_2d(&v_hf, cfg.n_kv_heads * dh, cfg.d_model);
+        tensors.push(
+            Tensor::from_vec(&[cfg.d_model, cfg.n_kv_heads * dh], v_trans)
+                .map_err(|e| ImportError::BadShape { name: format!("{v_name}: {e:?}") })?,
+        );
+
+        // wo [n_q_heads * dh, d_model]
+        let o_name = format!("model.layers.{i}.self_attn.o_proj.weight");
+        let o_hf = get_tensor(&o_name, &[cfg.d_model, cfg.n_q_heads * dh])?;
+        let o_trans = transpose_2d(&o_hf, cfg.d_model, cfg.n_q_heads * dh);
+        tensors.push(
+            Tensor::from_vec(&[cfg.n_q_heads * dh, cfg.d_model], o_trans)
+                .map_err(|e| ImportError::BadShape { name: format!("{o_name}: {e:?}") })?,
+        );
+
+        // rms2 [d_model]
+        let rms2_name = format!("model.layers.{i}.post_attention_layernorm.weight");
+        let rms2_floats = get_tensor(&rms2_name, &[cfg.d_model])?;
+        tensors.push(
+            Tensor::from_vec(&[cfg.d_model], rms2_floats)
+                .map_err(|e| ImportError::BadShape { name: format!("{rms2_name}: {e:?}") })?,
+        );
+
+        // w_gate [d_model, d_ff]
+        let gate_name = format!("model.layers.{i}.mlp.gate_proj.weight");
+        let gate_hf = get_tensor(&gate_name, &[cfg.d_ff, cfg.d_model])?;
+        let gate_trans = transpose_2d(&gate_hf, cfg.d_ff, cfg.d_model);
+        tensors.push(
+            Tensor::from_vec(&[cfg.d_model, cfg.d_ff], gate_trans)
+                .map_err(|e| ImportError::BadShape { name: format!("{gate_name}: {e:?}") })?,
+        );
+
+        // w_up [d_model, d_ff]
+        let up_name = format!("model.layers.{i}.mlp.up_proj.weight");
+        let up_hf = get_tensor(&up_name, &[cfg.d_ff, cfg.d_model])?;
+        let up_trans = transpose_2d(&up_hf, cfg.d_ff, cfg.d_model);
+        tensors.push(
+            Tensor::from_vec(&[cfg.d_model, cfg.d_ff], up_trans)
+                .map_err(|e| ImportError::BadShape { name: format!("{up_name}: {e:?}") })?,
+        );
+
+        // w_down [d_ff, d_model]
+        let down_name = format!("model.layers.{i}.mlp.down_proj.weight");
+        let down_hf = get_tensor(&down_name, &[cfg.d_model, cfg.d_ff])?;
+        let down_trans = transpose_2d(&down_hf, cfg.d_model, cfg.d_ff);
+        tensors.push(
+            Tensor::from_vec(&[cfg.d_ff, cfg.d_model], down_trans)
+                .map_err(|e| ImportError::BadShape { name: format!("{down_name}: {e:?}") })?,
+        );
+    }
+
+    // final_norm [d_model]
+    let norm_floats = get_tensor("model.norm.weight", &[cfg.d_model])?;
+    tensors.push(
+        Tensor::from_vec(&[cfg.d_model], norm_floats)
+            .map_err(|e| ImportError::BadShape { name: format!("final_norm: {e:?}") })?,
+    );
+
+    // lm_head handling
+    let has_lm_head = header.tensors.iter().any(|t| t.name == "lm_head.weight");
+    if cfg.tied_embeddings {
+        if has_lm_head {
+            let lm_floats = get_tensor("lm_head.weight", &[cfg.vocab_size, cfg.d_model])?;
+            if embed_floats.len() != lm_floats.len() {
+                return Err(ImportError::TiedMismatch);
+            }
+            for (&a, &b) in embed_floats.iter().zip(&lm_floats) {
+                if a.to_bits() != b.to_bits() {
+                    return Err(ImportError::TiedMismatch);
+                }
+            }
+        }
+    } else {
+        let lm_floats = get_tensor("lm_head.weight", &[cfg.vocab_size, cfg.d_model])?;
+        tensors.push(
+            Tensor::from_vec(&[cfg.vocab_size, cfg.d_model], lm_floats)
+                .map_err(|e| ImportError::BadShape { name: format!("lm_head: {e:?}") })?,
+        );
+    }
+
+    Model::from_tensors(cfg, tensors)
+        .map_err(|e| ImportError::InvalidJson(format!("Model::from_tensors failed: {e:?}")))
+}
+
+/// Remap in-memory donor config and safetensors bytes to a SandyRust `Model`.
+pub fn remap_safetensors_from_bytes(
+    config_json_bytes: &[u8],
+    safetensors_bytes: &[u8],
+    requested_seq_len: Option<usize>,
+) -> Result<Model, ImportError> {
+    let cfg = parse_donor_config(config_json_bytes, requested_seq_len)?;
+    let header = parse_safetensors_header(safetensors_bytes)?;
+    let data_offset = 8 + header.header_size;
+    if data_offset > safetensors_bytes.len() {
+        return Err(ImportError::OffsetOutOfBounds {
+            name: "header_boundary".to_string(),
+        });
+    }
+    remap_safetensors_to_model(&header, &safetensors_bytes[data_offset..], &cfg)
+}
+
+/// Import a pretrained model directory on disk into a SandyRust `Model` and `ImportManifest`.
+pub fn import_model(
+    model_dir: &Path,
+    requested_seq_len: Option<usize>,
+) -> Result<(Model, ImportManifest), ImportError> {
+    let canonical = safe_resolve_model_dir(model_dir)?;
+    let config_path = canonical.join("config.json");
+    let safetensors_path = canonical.join("model.safetensors");
+
+    if !config_path.exists() {
+        return Err(ImportError::Io("missing config.json in model directory".to_string()));
+    }
+    if !safetensors_path.exists() {
+        return Err(ImportError::Io("missing model.safetensors in model directory".to_string()));
+    }
+
+    let config_bytes = fs::read(&config_path).map_err(|e| ImportError::Io(e.to_string()))?;
+    let sha256_config_json = crate::sha256::sha256(&config_bytes);
+    let cfg = parse_donor_config(&config_bytes, requested_seq_len)?;
+
+    let (safetensors_header, safetensors_bytes) = read_safetensors_file(&safetensors_path)?;
+    let sha256_model_safetensors = crate::sha256::sha256(&safetensors_bytes);
+
+    let data_offset = 8 + safetensors_header.header_size;
+    let data_buffer = &safetensors_bytes[data_offset..];
+    let model = remap_safetensors_to_model(&safetensors_header, data_buffer, &cfg)?;
+
+    let tok_path = canonical.join("tokenizer.json");
+    let sha256_tokenizer_json = if tok_path.exists() {
+        let b = fs::read(&tok_path).map_err(|e| ImportError::Io(e.to_string()))?;
+        crate::sha256::sha256(&b)
+    } else {
+        [0u8; 32]
+    };
+
+    let tok_cfg_path = canonical.join("tokenizer_config.json");
+    let sha256_tokenizer_config_json = if tok_cfg_path.exists() {
+        let b = fs::read(&tok_cfg_path).map_err(|e| ImportError::Io(e.to_string()))?;
+        crate::sha256::sha256(&b)
+    } else {
+        [0u8; 32]
+    };
+
+    let license = safetensors_header
+        .metadata
+        .as_ref()
+        .and_then(|meta| {
+            meta.iter()
+                .find(|(k, _)| k == "license")
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let (sandyrust_commit, _) = crate::gates::detect_revision();
+
+    let manifest = ImportManifest {
+        source_repo: canonical.file_name().and_then(|s| s.to_str()).unwrap_or("unknown").to_string(),
+        source_commit: "unknown".to_string(),
+        source_license_spdx: license,
+        sha256_model_safetensors,
+        sha256_config_json,
+        sha256_tokenizer_json,
+        sha256_tokenizer_config_json,
+        importer_version: "sandy_rust-0.1.0-x17".to_string(),
+        mapping_table_version: "llama_dense_v1".to_string(),
+        sandyrust_commit,
+        dtype_source: safetensors_header
+            .tensors
+            .first()
+            .map(|t| format!("{:?}", t.dtype).to_lowercase())
+            .unwrap_or_else(|| "fp32".to_string()),
+        conversion: "exact-to-fp32".to_string(),
+    };
+
+    Ok((model, manifest))
+}
+
+// ---------------------------------------------------------------------------
 // Phase I1 Verification Gates GX17-0 through GX17-3 (§B11)
 // ---------------------------------------------------------------------------
 
@@ -1964,40 +2293,118 @@ pub fn gx17_3() -> GateReport {
     )
 }
 
+/// Construct a deterministic synthetic HuggingFace LLaMA model in safetensors format.
+pub fn build_synthetic_llama_safetensors() -> (String, Vec<u8>) {
+    let config_json = r#"{
+        "architectures": ["LlamaForCausalLM"],
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "vocab_size": 16,
+        "max_position_embeddings": 16,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0,
+        "bos_token_id": 0,
+        "eos_token_id": 1,
+        "pad_token_id": 2,
+        "tie_word_embeddings": true
+    }"#.to_string();
+
+    let mut tensors = Vec::new();
+    let mut data = Vec::new();
+
+    let mut add_tensor = |name: &str, shape: Vec<usize>, val_start: f32| {
+        let count: usize = shape.iter().product();
+        let start = data.len();
+        for i in 0..count {
+            let v = val_start + (i as f32 * 0.01);
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let end = data.len();
+        let shape_str = format!("{:?}", shape);
+        tensors.push(format!("\"{}\":{{\"dtype\":\"F32\",\"shape\":{},\"data_offsets\":[{},{}]}}", name, shape_str, start, end));
+    };
+
+    add_tensor("model.embed_tokens.weight", vec![16, 8], 0.1);
+    for i in 0..2 {
+        add_tensor(&format!("model.layers.{i}.input_layernorm.weight"), vec![8], 1.0);
+        add_tensor(&format!("model.layers.{i}.self_attn.q_proj.weight"), vec![8, 8], 0.05);
+        add_tensor(&format!("model.layers.{i}.self_attn.k_proj.weight"), vec![4, 8], 0.02);
+        add_tensor(&format!("model.layers.{i}.self_attn.v_proj.weight"), vec![4, 8], 0.03);
+        add_tensor(&format!("model.layers.{i}.self_attn.o_proj.weight"), vec![8, 8], 0.04);
+        add_tensor(&format!("model.layers.{i}.post_attention_layernorm.weight"), vec![8], 1.0);
+        add_tensor(&format!("model.layers.{i}.mlp.gate_proj.weight"), vec![16, 8], 0.06);
+        add_tensor(&format!("model.layers.{i}.mlp.up_proj.weight"), vec![16, 8], 0.07);
+        add_tensor(&format!("model.layers.{i}.mlp.down_proj.weight"), vec![8, 16], 0.08);
+    }
+    add_tensor("model.norm.weight", vec![8], 1.0);
+
+    let header_json = format!("{{{}}}", tensors.join(","));
+    let bytes = build_safetensors_bytes(&header_json, &data, 8);
+    (config_json, bytes)
+}
+
 /// GX17-4: Synthetic model mapping and RIMP round-trip determinism (§B11 GX17-4).
 pub fn gx17_4() -> GateReport {
     let t0 = Instant::now();
     let mut ok = true;
 
-    let cfg = Config {
-        schema_version: 1,
-        vocab_size: 16,
-        d_model: 8,
-        n_layers: 2,
-        n_q_heads: 2,
-        n_kv_heads: 1,
-        d_ff: 16,
-        max_seq_len: 16,
-        batch_size: 2,
-        rope_theta: 10000.0,
-        rms_eps: 1e-5,
-        bos_id: 0,
-        eos_id: 1,
-        pad_id: 2,
-        tied_embeddings: true,
-        seed: 0x1717_5EED,
-        ext_x13_hooks: false,
-        ext_x13_edit: false,
-        ext_x12e_entropy_sampling: false,
-        ext_x15_lora: false,
-        ext_x17_import: true,
-    };
+    // 1. Verify RoPE mathematical dot-product equivalence between naive HF rotate-half and SandyRust permuted layout (§B6)
+    let dh = 4;
+    let m = 3.0f64;
+    let theta = 10000.0f64;
+    let x_q = [0.12f32, -0.45, 0.78, 0.23];
+    let x_k = [0.65f32, 0.33, -0.19, 0.82];
 
-    let model = match Model::init(&cfg) {
+    // Naive HF rotate-half
+    let freq0 = theta.powf(0.0);
+    let freq1 = theta.powf(-2.0 / dh as f64);
+    let (s0, c0) = (m * freq0).sin_cos();
+    let (s1, c1) = (m * freq1).sin_cos();
+    let (s0, c0, s1, c1) = (s0 as f32, c0 as f32, s1 as f32, c1 as f32);
+
+    let q_hf_rot = [
+        x_q[0] * c0 - x_q[2] * s0,
+        x_q[1] * c1 - x_q[3] * s1,
+        x_q[2] * c0 + x_q[0] * s0,
+        x_q[3] * c1 + x_q[1] * s1,
+    ];
+    let k_hf_rot = [
+        x_k[0] * c0 - x_k[2] * s0,
+        x_k[1] * c1 - x_k[3] * s1,
+        x_k[2] * c0 + x_k[0] * s0,
+        x_k[3] * c1 + x_k[1] * s1,
+    ];
+    let dot_hf: f32 = q_hf_rot.iter().zip(&k_hf_rot).map(|(&a, &b)| a * b).sum();
+
+    // SandyRust permuted layout
+    let x_q_perm = [x_q[0], x_q[2], x_q[1], x_q[3]];
+    let x_k_perm = [x_k[0], x_k[2], x_k[1], x_k[3]];
+    let t_q = Tensor::from_vec(&[1, 4], x_q_perm.to_vec()).unwrap();
+    let t_k = Tensor::from_vec(&[1, 4], x_k_perm.to_vec()).unwrap();
+    let q_sandy = crate::tensor::ops::rope(&t_q, 10000.0, 3).unwrap();
+    let k_sandy = crate::tensor::ops::rope(&t_k, 10000.0, 3).unwrap();
+    let dot_sandy: f32 = q_sandy.data().iter().zip(k_sandy.data()).map(|(&a, &b)| a * b).sum();
+
+    let rope_equiv = (dot_hf - dot_sandy).abs() < 1e-6;
+    ok &= rope_equiv;
+
+    // 2. Build synthetic HF LLaMA safetensors model and import via remap_safetensors_from_bytes
+    let (config_json, safetensors_bytes) = build_synthetic_llama_safetensors();
+    let model = match remap_safetensors_from_bytes(config_json.as_bytes(), &safetensors_bytes, Some(16)) {
         Ok(m) => m,
-        Err(_) => return report("GX17-4", "acceptance", t0, false, "Synthetic model init", "init", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
+        Err(_) => return report("GX17-4", "acceptance", t0, false, "Remap synthetic model", "remap", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
     };
 
+    // 3. Verify forward pass executes and produces all-finite logits
+    let test_prompt = [0u32, 5, 2];
+    let fwd_res = model.forward(&test_prompt, None);
+    let fwd_finite = fwd_res.as_ref().map(|t| t.data().iter().all(|x| x.is_finite())).unwrap_or(false);
+    ok &= fwd_finite;
+
+    // 4. RIMP checkpoint export & round-trip determinism
     let manifest_hash = [0xABu8; 32];
     let tok_fp = [0xCDu8; 32];
 
@@ -2010,27 +2417,29 @@ pub fn gx17_4() -> GateReport {
         Err(_) => return report("GX17-4", "acceptance", t0, false, "Synthetic serialize 2", "serialize", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
     };
 
-    // Determinism test: identical bytes across runs
     let deterministic = bytes1 == bytes2;
     ok &= deterministic;
 
-    // Deserialization test
+    // 5. Deserialization bitwise match across all tensors
     let loaded = match deserialize_rimp(&bytes1, Some(manifest_hash), 64 * 1024 * 1024) {
         Ok(m) => m,
         Err(_) => return report("GX17-4", "acceptance", t0, false, "Synthetic deserialize", "deserialize", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
     };
 
-    // Bitwise match across all tensors
     let orig_tensors = model.tensors();
     let loaded_tensors = loaded.tensors();
-    ok &= orig_tensors.len() == loaded_tensors.len();
+    let tensors_count_match = orig_tensors.len() == loaded_tensors.len();
+    ok &= tensors_count_match;
+
+    let mut bitwise_tensors = true;
     for ((n1, t1), (n2, t2)) in orig_tensors.iter().zip(&loaded_tensors) {
-        ok &= n1 == n2;
-        ok &= t1.shape() == t2.shape();
+        bitwise_tensors &= n1 == n2;
+        bitwise_tensors &= t1.shape() == t2.shape();
         for (&x, &y) in t1.data().iter().zip(t2.data()) {
-            ok &= x.to_bits() == y.to_bits();
+            bitwise_tensors &= x.to_bits() == y.to_bits();
         }
     }
+    ok &= bitwise_tensors;
 
     report(
         "GX17-4",
@@ -2038,14 +2447,14 @@ pub fn gx17_4() -> GateReport {
         t0,
         ok,
         "Mapping on synthetic model and RIMP round-trip determinism (§B11 GX17-4)",
-        "RIMP serialization, deserialization, and deterministic bitwise equality verified on synthetic model",
-        "Synthetic model with GQA and import profile hyperparameters",
-        "Non-deterministic checkpoint serialization or float degradation",
-        "gx17-4-synthetic-roundtrip-v1".to_string(),
+        "HF LLaMA safetensors remapping, RoPE mathematical equivalence, RIMP serialization, and bitwise roundtrip verified",
+        "Synthetic LLaMA safetensors model with GQA and import profile hyperparameters",
+        "Non-deterministic checkpoint serialization, layout corruption, or float degradation",
+        "gx17-4-synthetic-roundtrip-v2".to_string(),
         "synthetic_import",
         "fp32",
-        "Determinism=true, bitwise match=true".to_string(),
-        format!("determinism={deterministic}, bitwise_match={ok}"),
+        "rope_equiv=true, fwd_finite=true, deterministic=true, bitwise_match=true".to_string(),
+        format!("rope_equiv={rope_equiv}, fwd_finite={fwd_finite}, deterministic={deterministic}, bitwise_match={bitwise_tensors}"),
         0.0,
         0.0,
     )

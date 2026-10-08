@@ -8,7 +8,7 @@
   "implemented_check": "GX17-0 baseline untouched; GX17-1 negative suite; GX17-2 fuzz test; GX17-3 dtype conversion; GX17-4 synthetic roundtrip; GX17-6 identity binding",
   "prerequisites": "Pure-Rust safetensors reader, RIMP checkpoint format, and cryptographic hash bindings",
   "exclusions": "Regression, identity bypass, or baseline behavioral mutation",
-  "revision": "64e8c1e",
+  "revision": "9fa9d5b",
   "dirty_state": true,
   "toolchain": "rustc-1.85.0-x86_64-unknown-linux-gnu",
   "target": "x86_64-unknown-linux-gnu",
