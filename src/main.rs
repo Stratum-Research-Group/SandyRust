@@ -258,6 +258,83 @@ fn main() -> ExitCode {
             println!("  SPDX License:    {}", manifest.source_license_spdx);
             ExitCode::SUCCESS
         }
+        Some("import-inspect") => {
+            let model_dir = match flag(&args, "--model-dir") {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    eprintln!("missing required flag --model-dir");
+                    return ExitCode::from(2);
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let dir_path = Path::new(model_dir);
+            let sf_path = dir_path.join("model.safetensors");
+            if !sf_path.exists() {
+                eprintln!("error: 'model.safetensors' not found in '{}'", dir_path.display());
+                return ExitCode::FAILURE;
+            }
+
+            let file_bytes = match fs::read(&sf_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("failed to read '{}': {e}", sf_path.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let header = match sandy_rust::import::parse_safetensors_header(&file_bytes) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("failed to parse safetensors header: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let cfg_path = dir_path.join("config.json");
+            let donor_cfg = if cfg_path.exists() {
+                match fs::read(&cfg_path) {
+                    Ok(b) => sandy_rust::import::parse_donor_config(&b, None).ok(),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            println!("Safetensors Header Inspection for '{}':", dir_path.display());
+            if let Some(ref dc) = donor_cfg {
+                println!("  Hidden Size (d_model): {}", dc.d_model);
+                println!("  Layers:                {}", dc.n_layers);
+                println!("  Heads:                 {} q / {} kv", dc.n_q_heads, dc.n_kv_heads);
+                println!("  Intermediate (d_ff):   {}", dc.d_ff);
+                println!("  Vocab Size:            {}", dc.vocab_size);
+                println!("  Tied Embeddings:       {}", dc.tied_embeddings);
+                println!("  RoPE Theta:            {}", dc.rope_theta);
+            }
+            if let Some(ref meta) = header.metadata {
+                println!("  Metadata Entries:  {}", meta.len());
+                for (k, v) in meta {
+                    println!("    {k}: {v}");
+                }
+            }
+
+            println!("\nTensors ({} total):", header.tensors.len());
+            println!("{:<45} {:<6} {:<20} {:>12}", "Tensor Name", "Dtype", "Shape", "Bytes");
+            println!("{:-<45} {:-<6} {:-<20} {:-<12}", "", "", "", "");
+            let mut total_bytes = 0usize;
+            for t in &header.tensors {
+                let bytes = t.data_offsets.1 - t.data_offsets.0;
+                total_bytes += bytes;
+                let shape_str = format!("{:?}", t.shape);
+                println!("{:<45} {:<6?} {:<20} {:>12}", t.name, t.dtype, shape_str, bytes);
+            }
+            println!("{:-<45} {:-<6} {:-<20} {:-<12}", "", "", "", "");
+            println!("{:<45} {:<6} {:<20} {:>12}", "Total Payload", "", "", total_bytes);
+
+            ExitCode::SUCCESS
+        }
         Some("checkpoint") => {
             let init_path = match flag(&args, "--init") {
                 Ok(v) => v,
@@ -291,34 +368,102 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("generate") => {
+            let import_flag = match flag(&args, "--import") {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
             let ckpt_flag = match flag(&args, "--checkpoint") {
                 Ok(v) => v,
                 Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
             };
-            let model = match ckpt_flag {
-                Some(p) => match checkpoint::load(Path::new(p), &cfg, DEFAULT_MAX_BYTES) {
+
+            let (model, bpe_opt) = if let Some(rimp_path) = import_flag {
+                let m = match sandy_rust::import::load_rimp(Path::new(rimp_path), None, 512 * 1024 * 1024) {
                     Ok(m) => m,
-                    Err(e) => { eprintln!("rejected: {e:?}"); return ExitCode::FAILURE; }
-                },
-                None => {
-                    eprintln!("note: random-initialised weights (untrained); output is a smoke test only");
-                    match Model::init(&cfg) {
-                        Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("import load rejected: {e:?}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let tok_path_flag = match flag(&args, "--tokenizer") {
+                    Ok(v) => v,
+                    Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+                };
+                let bpe = if let Some(tp) = tok_path_flag {
+                    match sandy_rust::import::BpeTokenizer::from_file(Path::new(tp)) {
+                        Ok(b) => Some(b),
                         Err(e) => {
-                            eprintln!("model init error: {e:?}");
-                            return ExitCode::FAILURE;
+                            eprintln!("warning: failed to load tokenizer from {tp}: {e:?}");
+                            None
                         }
                     }
-                }
+                } else {
+                    let rimp_p = Path::new(rimp_path);
+                    let candidate = rimp_p.parent().unwrap_or(Path::new(".")).join("tokenizer.json");
+                    if candidate.exists() {
+                        sandy_rust::import::BpeTokenizer::from_file(&candidate).ok()
+                    } else {
+                        None
+                    }
+                };
+                (m, bpe)
+            } else {
+                let m = match ckpt_flag {
+                    Some(p) => match checkpoint::load(Path::new(p), &cfg, DEFAULT_MAX_BYTES) {
+                        Ok(m) => m,
+                        Err(e) => { eprintln!("rejected: {e:?}"); return ExitCode::FAILURE; }
+                    },
+                    None => {
+                        eprintln!("note: random-initialised weights (untrained); output is a smoke test only");
+                        match Model::init(&cfg) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                eprintln!("model init error: {e:?}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
+                };
+                (m, None)
             };
-            let tok = ByteTokenizer::new();
-            let mut prompt = vec![BOS];
-            let prompt_text = match flag(&args, "--prompt") {
-                Ok(Some(s)) => s,
-                Ok(None) => "Rust",
+
+            let prompt_ids_flag = match flag(&args, "--prompt-ids") {
+                Ok(v) => v,
                 Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
             };
-            prompt.extend(tok.encode(prompt_text));
+            let prompt = if let Some(ids_str) = prompt_ids_flag {
+                let mut ids = Vec::new();
+                for part in ids_str.split(',') {
+                    let id = match part.trim().parse::<u32>() {
+                        Ok(i) => i,
+                        Err(_) => {
+                            eprintln!("invalid token id in --prompt-ids: '{part}'");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    ids.push(id);
+                }
+                ids
+            } else {
+                let prompt_text = match flag(&args, "--prompt") {
+                    Ok(Some(s)) => s,
+                    Ok(None) => "Rust",
+                    Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+                };
+                if let Some(ref bpe) = bpe_opt {
+                    let mut p = Vec::new();
+                    if let Some(bos) = bpe.bos_id() {
+                        p.push(bos);
+                    }
+                    p.extend(bpe.encode(prompt_text, true));
+                    p
+                } else {
+                    let tok = ByteTokenizer::new();
+                    let mut p = vec![BOS];
+                    p.extend(tok.encode(prompt_text));
+                    p
+                }
+            };
 
             let temp: f32 = match parse_flag(&args, "--temperature", 0.0f32) {
                 Ok(v) => v,
@@ -351,7 +496,12 @@ fn main() -> ExitCode {
             };
             match generate(&model, &prompt, &params) {
                 Ok(out) => {
-                    println!("{:?}", tok.decode(&out.tokens).unwrap_or_default());
+                    if let Some(ref bpe) = bpe_opt {
+                        println!("{}", bpe.decode_lossy(&out.tokens));
+                    } else {
+                        let tok = ByteTokenizer::new();
+                        println!("{:?}", tok.decode(&out.tokens).unwrap_or_default());
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(e) => { eprintln!("generation error: {e:?}"); ExitCode::FAILURE }
@@ -770,10 +920,11 @@ fn main() -> ExitCode {
             eprintln!("commands:");
             eprintln!("  verify      [--gates <list>|all|baseline] [--artifacts <dir>]");
             eprintln!("  import      --model-dir <dir> --out <file.rimp>");
+            eprintln!("  import-inspect --model-dir <dir>");
             eprintln!("  train       [--steps n] [--lr f] [--dataset path] [--save-state path] [--resume path] [--checkpoint path] [--val-every n]");
             eprintln!("  gradcheck");
             eprintln!("  checkpoint  --init <path> | --inspect <path>");
-            eprintln!("  generate    [--prompt s] [--max-tokens n] [--temperature t] [--top-k k] [--top-p p] [--seed n] [--checkpoint path]");
+            eprintln!("  generate    [--prompt s] [--prompt-ids list] [--import path] [--tokenizer path] [--max-tokens n] [--temperature t] [--top-k k] [--top-p p] [--seed n] [--checkpoint path]");
             eprintln!("  inspect     [--prompt s] [--mode record|steer] [--alpha f]");
             eprintln!("  eval flip   [--task <name>] [--split <name>]");
             ExitCode::from(2)

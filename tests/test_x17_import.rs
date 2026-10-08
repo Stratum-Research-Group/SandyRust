@@ -448,3 +448,53 @@ fn test_bpe_caps_and_rejections() {
     let res = sandy_rust::import::BpeTokenizer::from_json_bytes(bad_len_json.as_bytes());
     assert!(matches!(res, Err(sandy_rust::import::ImportError::TooLarge { .. })));
 }
+
+#[test]
+fn test_import_inspect_and_generation_with_bpe() {
+    let tmp = std::env::temp_dir().join(format!("sandy_test_i5_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let (cfg_json, sf_bytes) = sandy_rust::import::build_synthetic_llama_safetensors();
+    let tok_json = sandy_rust::import::make_synthetic_bpe_tokenizer_json();
+
+    std::fs::write(tmp.join("config.json"), &cfg_json).unwrap();
+    std::fs::write(tmp.join("model.safetensors"), &sf_bytes).unwrap();
+    std::fs::write(tmp.join("tokenizer.json"), &tok_json).unwrap();
+
+    // 1. Inspect
+    let parsed_header = sandy_rust::import::parse_safetensors_header(&sf_bytes).unwrap();
+    assert_eq!(parsed_header.tensors.len(), 20);
+
+    // 2. Import model and save RIMP
+    let (model, manifest) = sandy_rust::import::import_model(&tmp, Some(16)).unwrap();
+    let rimp_path = tmp.join("model.rimp");
+    sandy_rust::import::save_rimp(&rimp_path, &model, manifest.fingerprint(), [0u8; 32]).unwrap();
+
+    // 3. Load RIMP
+    let loaded_model = sandy_rust::import::load_rimp(&rimp_path, Some(manifest.fingerprint()), 64 * 1024 * 1024).unwrap();
+    assert_eq!(loaded_model.param_count(), model.param_count());
+
+    // 4. BPE Tokenizer encoding and decoding
+    let bpe = sandy_rust::import::BpeTokenizer::from_file(tmp.join("tokenizer.json")).unwrap();
+    let prompt_ids = bpe.encode("hello world", true);
+    assert_eq!(prompt_ids, vec![261, 266]);
+    assert_eq!(bpe.decode(&prompt_ids).unwrap(), "hello world");
+
+    // 5. Generation on imported model with valid token IDs (0..16)
+    let model_prompt = [0u32, 1, 2];
+    let params = sandy_rust::generation::SamplingParams {
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        max_new_tokens: 4,
+        seed: 42,
+        adaptive: None,
+    };
+    let gen_out = sandy_rust::generation::generate(&loaded_model, &model_prompt, &params).unwrap();
+    assert_eq!(gen_out.tokens.len(), 4);
+    assert!(gen_out.tokens.iter().all(|&t| t < 16));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
