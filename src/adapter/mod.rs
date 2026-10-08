@@ -668,8 +668,14 @@ pub fn gx15() -> crate::gates::GateReport {
     }
 
     // 5. Identity checks (wrong base hash, wrong rank, corrupted payload)
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let cnt = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
-    let tmp_path = std::env::temp_dir().join(format!("gx15_test_adapter_{pid}.bin"));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = std::env::temp_dir().join(format!("gx15_test_adapter_{pid}_{nanos}_{cnt}.bin"));
     let tmp_file = tmp_path.as_path();
     trained_adapter.save(tmp_file).unwrap();
 

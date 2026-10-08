@@ -1,5 +1,6 @@
 //! SandyRust: standalone pure-Rust decoder-only transformer (specv3.md).
 pub mod adapter;
+pub mod arena;
 pub mod attention;
 pub mod autodiff;
 pub mod cache;
