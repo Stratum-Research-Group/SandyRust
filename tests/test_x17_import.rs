@@ -70,8 +70,11 @@ fn test_gx17_6_identity_and_binding() {
 
 #[test]
 fn test_gx17_runner_dispatch() {
-    let reps = gates::run(&["gx17", "gx17_0", "gx17_1", "gx17_2", "gx17_3", "gx17_4", "gx17_6"]).unwrap();
-    assert_eq!(reps.len(), 7);
+    let reps = gates::run(&[
+        "gx17", "gx17_0", "gx17_1", "gx17_2", "gx17_3", "gx17_4", "gx17_6", "gx17_8",
+    ])
+    .unwrap();
+    assert_eq!(reps.len(), 8);
     for r in reps {
         assert_eq!(r.status, "PASS", "Gate {} failed", r.gate_id);
     }
@@ -346,4 +349,102 @@ fn test_negative_mapping_rejections() {
     assert!(matches!(res, Err(sandy_rust::import::ImportError::NonFinite { .. })));
 }
 
+#[test]
+fn test_gx17_8_gate() {
+    let rep = sandy_rust::import::gx17_8();
+    assert_eq!(rep.status, "PASS");
+    assert_eq!(rep.gate_id, "GX17-8");
+    assert_eq!(rep.scope, "acceptance");
+}
 
+#[test]
+fn test_bpe_byte_to_unicode_bijection() {
+    let (byte_to_char, char_to_byte) = sandy_rust::import::bpe::bytes_to_unicode();
+
+    // Verify all 256 bytes are bijective
+    for b in 0u8..=255 {
+        let ch = byte_to_char[b as usize];
+        assert_eq!(char_to_byte.get(&ch), Some(&b));
+    }
+
+    // Verify space is 'Ġ'
+    assert_eq!(byte_to_char[32], 'Ġ');
+    assert_eq!(char_to_byte.get(&'Ġ'), Some(&32));
+
+    // Verify exactly 256 unique characters
+    let set: std::collections::HashSet<char> = byte_to_char.iter().copied().collect();
+    assert_eq!(set.len(), 256);
+}
+
+#[test]
+fn test_bpe_pre_tokenizer_scanners() {
+    // 1. GPT-2 scanner tests
+    let chunks_gpt2 = sandy_rust::import::bpe::split_gpt2("Hello, world! It's 123 dogs.");
+    assert_eq!(chunks_gpt2, vec!["Hello", ",", " world", "!", " It", "'s", " 123", " dogs", "."]);
+
+    let ws_gpt2 = sandy_rust::import::bpe::split_gpt2("  hello   world  ");
+    assert_eq!(ws_gpt2, vec!["  ", "hello", "   ", "world", "  "]);
+
+    // 2. LLaMA-3 scanner tests
+    let chunks_llama = sandy_rust::import::bpe::split_llama3("Hello, world! It's 123456 dogs.");
+    // Digits chunked into up to 3 digits (\p{N}{1,3}): "123", "456"
+    assert!(chunks_llama.contains(&"123"));
+    assert!(chunks_llama.contains(&"456"));
+}
+
+#[test]
+fn test_bpe_synthetic_tokenizer_encode_decode_roundtrip() {
+    let json_str = sandy_rust::import::make_synthetic_bpe_tokenizer_json();
+    let tokenizer = sandy_rust::import::BpeTokenizer::from_json_bytes(json_str.as_bytes()).unwrap();
+
+    // 1. Golden ASCII
+    let ascii = "hello world";
+    let ids = tokenizer.encode(ascii, false);
+    assert_eq!(ids, vec![261, 266]); // "hello", " world"
+    let decoded = tokenizer.decode(&ids).unwrap();
+    assert_eq!(decoded, ascii);
+
+    // 2. Special tokens
+    let special_text = "<|im_start|>hello<|endoftext|>";
+    let ids_spec = tokenizer.encode(special_text, true);
+    assert_eq!(ids_spec, vec![1, 261, 0]);
+    let dec_spec = tokenizer.decode(&ids_spec).unwrap();
+    assert_eq!(dec_spec, special_text);
+
+    // 3. Multilingual and emojis roundtrip
+    let multi = "café München déjà vu Привет 你好 🦀🚀 🌟";
+    let ids_multi = tokenizer.encode(multi, false);
+    let dec_multi = tokenizer.decode(&ids_multi).unwrap();
+    assert_eq!(dec_multi, multi);
+
+    // 4. 10 KB payload roundtrip
+    let payload = "SandyRust BPE pure-Rust std-only test. ".repeat(300);
+    assert!(payload.len() > 10 * 1024);
+    let ids_payload = tokenizer.encode(&payload, false);
+    let dec_payload = tokenizer.decode(&ids_payload).unwrap();
+    assert_eq!(dec_payload, payload);
+}
+
+#[test]
+fn test_bpe_caps_and_rejections() {
+    // 1. Unsupported model type
+    let bad_model = br#"{"model":{"type":"Unigram"}}"#;
+    let res = sandy_rust::import::BpeTokenizer::from_json_bytes(bad_model);
+    assert!(matches!(res, Err(sandy_rust::import::ImportError::UnsupportedTokenizer(_))));
+
+    // 2. Non-null normalizer
+    let bad_norm = br#"{"model":{"type":"BPE","vocab":{},"merges":[]},"normalizer":{"type":"NFC"}}"#;
+    let res = sandy_rust::import::BpeTokenizer::from_json_bytes(bad_norm);
+    assert!(matches!(res, Err(sandy_rust::import::ImportError::UnsupportedTokenizer(_))));
+
+    // 3. Invalid JSON
+    let bad_json = b"{\"model\":";
+    let res = sandy_rust::import::BpeTokenizer::from_json_bytes(bad_json);
+    assert!(matches!(res, Err(sandy_rust::import::ImportError::InvalidJson(_))));
+
+    // 4. Token length cap (> 256 bytes)
+    let long_key = "x".repeat(300);
+    let bad_len_json = format!(r#"{{"model":{{"type":"BPE","vocab":{{"{}":1}},"merges":[]}}}}"#, long_key);
+    let res = sandy_rust::import::BpeTokenizer::from_json_bytes(bad_len_json.as_bytes());
+    assert!(matches!(res, Err(sandy_rust::import::ImportError::TooLarge { .. })));
+}

@@ -54,6 +54,8 @@ To prevent evidence inflation and distinguish superficial smoke tests from verif
 | **GX13** | `acceptance` | `PASS` | Activation hooks, inspectability & bounded steering (`Addendum A1 §A2`) | Bitwise match on disabled/record/zero/patch; export caps; cache intervention policy hash | `Config::reference_v2` | Training-time steering |
 | **GX14** | `acceptance` | `PASS` | Paired perturbation & semantic flip-rate evaluation (`Addendum A1 §A3`) | Deterministic generators, 0% split prompt leakage, hand-worked metrics parity, bootstrap reproducibility, trivial baselines | `Config::reference_v2` | Model training dependencies |
 | **GX15** | `acceptance` | `PASS` | FP32 Low-Rank Adaptation (LoRA) (`Addendum A1 §A5`) | Zero-init bitwise match, analytic gradcheck vs finite differences, base weight immutability, merge equivalence $W' = W + sBA$, header integrity & adapter compatibility | `Config::reference_v2` | Quantized LoRA, base weight training |
+| **GX17** | `acceptance` | `PASS` | External Pretrained Weight Import Phases I1–I4 (`specv3 §3.6, §13.2`) | Safetensors reader, RIMP checkpoint format, float conversions, RoPE permutation, cryptographic bindings, BPE tokenizer | `import_profile` | Sharded models, quantization |
+| **GX17-8** | `acceptance` | `PASS` | Tokenizer golden vectors and roundtrip parity (`specv3 §B10.1, §B11`) | Byte-to-Unicode bijection, cap enforcement, ASCII, contraction, UTF-8, emoji, whitespace, special token golden vectors, 10 KB roundtrip | `import_profile` | Non-BPE tokenizers, non-null normalizers |
 
 ---
 

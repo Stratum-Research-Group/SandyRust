@@ -777,6 +777,7 @@ pub fn run(ids: &[&str]) -> Result<Vec<GateReport>, String> {
             "gx17_3" | "gx17-3" => crate::import::gx17_3(),
             "gx17_4" | "gx17-4" => crate::import::gx17_4(),
             "gx17_6" | "gx17-6" => crate::import::gx17_6(),
+            "gx17_8" | "gx17-8" => crate::import::gx17_8(),
             other => return Err(format!("unknown gate id: '{other}'")),
         };
         reports.push(rep);

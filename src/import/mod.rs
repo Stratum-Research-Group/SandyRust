@@ -15,6 +15,9 @@ use crate::model::Model;
 use crate::sha256::hex;
 use crate::tensor::Tensor;
 
+pub mod bpe;
+pub use bpe::BpeTokenizer;
+
 /// Hard security and memory limits per spec (§B5, D10).
 pub const HEADER_CAP: u64 = 8 * 1024 * 1024; // 8 MiB maximum header size
 pub const HEADER_TENSOR_CAP: usize = 4096; // Maximum tensor count in header
@@ -42,6 +45,7 @@ pub enum ImportError {
     TiedMismatch,
     UnsupportedRope,
     UnsupportedArchitecture(String),
+    UnsupportedTokenizer(String),
     TooLarge { what: &'static str, size: usize, cap: usize },
     ShardedNotSupported,
     TokenizerMismatch,
@@ -84,6 +88,7 @@ impl fmt::Display for ImportError {
             ImportError::TiedMismatch => write!(f, "Tied embeddings weight mismatch with lm_head"),
             ImportError::UnsupportedRope => write!(f, "Unsupported RoPE scaling or variant"),
             ImportError::UnsupportedArchitecture(s) => write!(f, "Unsupported architecture: {s}"),
+            ImportError::UnsupportedTokenizer(s) => write!(f, "Unsupported tokenizer: {s}"),
             ImportError::TooLarge { what, size, cap } => {
                 write!(f, "{what} size {size} exceeds cap {cap}")
             }
@@ -397,14 +402,44 @@ impl<'a> JsonParser<'a> {
                             .map_err(|_| ImportError::InvalidJson("invalid unicode escape".to_string()))?;
                         let code_point = u16::from_str_radix(hex_str, 16)
                             .map_err(|_| ImportError::InvalidJson("invalid unicode hex".to_string()))?;
-                        let ch = char::from_u32(code_point as u32)
-                            .ok_or_else(|| ImportError::InvalidJson("invalid code point".to_string()))?;
-                        out.push(ch);
+
+                        if (0xD800..=0xDBFF).contains(&code_point) {
+                            if self.pos + 6 <= self.src.len() && &self.src[self.pos..self.pos + 2] == b"\\u" {
+                                self.pos += 2;
+                                let low_hex = &self.src[self.pos..self.pos + 4];
+                                self.pos += 4;
+                                let low_str = std::str::from_utf8(low_hex)
+                                    .map_err(|_| ImportError::InvalidJson("invalid unicode surrogate escape".to_string()))?;
+                                let low_cp = u16::from_str_radix(low_str, 16)
+                                    .map_err(|_| ImportError::InvalidJson("invalid unicode surrogate hex".to_string()))?;
+                                if (0xDC00..=0xDFFF).contains(&low_cp) {
+                                    let scalar = 0x10000 + (((code_point - 0xD800) as u32) << 10) + ((low_cp - 0xDC00) as u32);
+                                    let ch = char::from_u32(scalar)
+                                        .ok_or_else(|| ImportError::InvalidJson("invalid surrogate pair scalar".to_string()))?;
+                                    out.push(ch);
+                                } else {
+                                    return Err(ImportError::InvalidJson("invalid low surrogate in unicode escape".to_string()));
+                                }
+                            } else {
+                                return Err(ImportError::InvalidJson("unpaired high surrogate in unicode escape".to_string()));
+                            }
+                        } else {
+                            let ch = char::from_u32(code_point as u32)
+                                .ok_or_else(|| ImportError::InvalidJson("invalid code point".to_string()))?;
+                            out.push(ch);
+                        }
                     }
                     other => {
                         return Err(ImportError::InvalidJson(format!("invalid escape character '\\{}'", other as char)));
                     }
                 }
+            } else if b >= 0x80 {
+                self.pos -= 1;
+                let s = std::str::from_utf8(&self.src[self.pos..])
+                    .map_err(|_| ImportError::InvalidJson("invalid utf-8 in string".to_string()))?;
+                let ch = s.chars().next().unwrap();
+                self.pos += ch.len_utf8();
+                out.push(ch);
             } else {
                 out.push(b as char);
             }
@@ -2552,7 +2587,237 @@ pub fn gx17_6() -> GateReport {
     )
 }
 
-/// Composite Gate GX17 report covering Phase I1 & Phase I2 deliverables.
+/// Helper to construct synthetic valid HuggingFace tokenizer.json
+pub fn make_synthetic_bpe_tokenizer_json() -> String {
+    let (byte_to_char, _) = bpe::bytes_to_unicode();
+    let mut vocab_entries = Vec::new();
+
+    vocab_entries.push("\"<|endoftext|>\": 0".to_string());
+    vocab_entries.push("\"<|im_start|>\": 1".to_string());
+
+    for b in 0u8..=255 {
+        let ch = byte_to_char[b as usize];
+        let id = 2 + (b as u32);
+        let escaped = match ch {
+            '"' => "\\\"".to_string(),
+            '\\' => "\\\\".to_string(),
+            _ => ch.to_string(),
+        };
+        vocab_entries.push(format!("\"{}\": {}", escaped, id));
+    }
+
+    let custom = [
+        ("he", 258),
+        ("ll", 259),
+        ("hell", 260),
+        ("hello", 261),
+        ("Ġw", 262),
+        ("or", 263),
+        ("ld", 264),
+        ("world", 265),
+        ("Ġworld", 266),
+        ("Ġt", 267),
+        ("Ġth", 268),
+        ("Ġthe", 269),
+        ("'s", 270),
+        ("'t", 271),
+        ("Ġis", 272),
+    ];
+    for (tok, id) in custom {
+        vocab_entries.push(format!("\"{}\": {}", tok, id));
+    }
+
+    let merges = [
+        "h e",
+        "l l",
+        "he ll",
+        "hell o",
+        "o r",
+        "l d",
+        "or ld",
+        "w orld",
+        "Ġ world",
+        "Ġ w",
+        "Ġ t",
+        "Ġt h",
+        "Ġth e",
+        "' s",
+        "' t",
+        "Ġ i",
+        "Ġi s",
+    ];
+
+    let merges_json = merges
+        .iter()
+        .map(|m| format!("\"{}\"", m))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        r#"{{"version":"1.0","normalizer":null,"pre_tokenizer":{{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}},"model":{{"type":"BPE","vocab":{{{}}},"merges":[{}]}},"added_tokens":[{{"id":0,"content":"<|endoftext|>","special":true}},{{"id":1,"content":"<|im_start|>","special":true}}]}}"#,
+        vocab_entries.join(", "),
+        merges_json
+    )
+}
+
+/// Gate GX17-8: HuggingFace BPE Tokenizer golden vectors and roundtrip parity.
+pub fn gx17_8() -> GateReport {
+    let t0 = Instant::now();
+    let mut ok = true;
+
+    // 1. Byte-to-Unicode bijection check
+    let (byte_to_char, char_to_byte) = bpe::bytes_to_unicode();
+    let mut bijection_ok = true;
+    for b in 0u8..=255 {
+        let ch = byte_to_char[b as usize];
+        if char_to_byte.get(&ch) != Some(&b) {
+            bijection_ok = false;
+            break;
+        }
+    }
+    if byte_to_char[32] != 'Ġ' {
+        bijection_ok = false;
+    }
+    ok &= bijection_ok;
+
+    // 2. Negative and security cap rejection
+    let neg_wordpiece = BpeTokenizer::from_json_bytes(br#"{"model":{"type":"WordPiece"}}"#);
+    let neg_wp_ok = matches!(neg_wordpiece, Err(ImportError::UnsupportedTokenizer(_)));
+
+    let neg_normalizer = BpeTokenizer::from_json_bytes(
+        br#"{"model":{"type":"BPE","vocab":{},"merges":[]},"normalizer":{"type":"Prepend"}}"#,
+    );
+    let neg_norm_ok = matches!(neg_normalizer, Err(ImportError::UnsupportedTokenizer(_)));
+
+    let neg_invalid_json = BpeTokenizer::from_json_bytes(b"not json {[[");
+    let neg_json_ok = matches!(neg_invalid_json, Err(ImportError::InvalidJson(_)));
+
+    let long_token = "a".repeat(257);
+    let neg_long_token_json = format!(
+        r#"{{"model":{{"type":"BPE","vocab":{{"{}":0}},"merges":[]}}}}"#,
+        long_token
+    );
+    let neg_cap_ok = matches!(
+        BpeTokenizer::from_json_bytes(neg_long_token_json.as_bytes()),
+        Err(ImportError::TooLarge { .. })
+    );
+
+    ok &= neg_wp_ok && neg_norm_ok && neg_json_ok && neg_cap_ok;
+
+    // 3. Synthetic BPE tokenizer golden vector testing
+    let syn_json = make_synthetic_bpe_tokenizer_json();
+    let tokenizer = match BpeTokenizer::from_json_bytes(syn_json.as_bytes()) {
+        Ok(t) => t,
+        Err(_) => {
+            return report(
+                "GX17-8",
+                "acceptance",
+                t0,
+                false,
+                "Tokenizer golden vectors (specv3 §B10.1, §B11 GX17-8)",
+                "Failed to instantiate synthetic BPE tokenizer",
+                "Pure-Rust HuggingFace BPE tokenizer and fast JSON parser",
+                "Tokenizer parse failure",
+                "gx17-8-bpe-tokenizer-v1".to_string(),
+                "import_profile",
+                "fp32",
+                "PASS".to_string(),
+                "FAIL".to_string(),
+                0.0,
+                0.0,
+            );
+        }
+    };
+
+    // Case 1: Empty string
+    let enc_empty = tokenizer.encode("", false);
+    let dec_empty = tokenizer.decode(&enc_empty).unwrap_or_default();
+    let case1_ok = enc_empty.is_empty() && dec_empty.is_empty();
+    ok &= case1_ok;
+
+    // Case 2: ASCII golden vector
+    let text_ascii = "hello world";
+    let enc_ascii = tokenizer.encode(text_ascii, false);
+    let golden_ascii = vec![261, 266];
+    let case2_golden = enc_ascii == golden_ascii;
+    let dec_ascii = tokenizer.decode(&enc_ascii).unwrap_or_default();
+    let case2_ok = case2_golden && dec_ascii == text_ascii;
+    ok &= case2_ok;
+
+    // Case 3: Contractions
+    let text_cont = "It's";
+    let enc_cont = tokenizer.encode(text_cont, false);
+    let dec_cont = tokenizer.decode(&enc_cont).unwrap_or_default();
+    let case3_ok = dec_cont == text_cont;
+    ok &= case3_ok;
+
+    // Case 4: Multilingual UTF-8
+    let text_utf8 = "café München déjà vu Привет 你好";
+    let enc_utf8 = tokenizer.encode(text_utf8, false);
+    let dec_utf8 = tokenizer.decode(&enc_utf8).unwrap_or_default();
+    let case4_ok = dec_utf8 == text_utf8;
+    ok &= case4_ok;
+
+    // Case 5: Emoji
+    let text_emoji = "🦀 🚀 🌟 🦀🦀";
+    let enc_emoji = tokenizer.encode(text_emoji, false);
+    let dec_emoji = tokenizer.decode(&enc_emoji).unwrap_or_default();
+    let case5_ok = dec_emoji == text_emoji;
+    ok &= case5_ok;
+
+    // Case 6: Whitespace runs and newlines
+    let text_ws = "    \n\n\t  multiple   spaces  \n";
+    let enc_ws = tokenizer.encode(text_ws, false);
+    let dec_ws = tokenizer.decode(&enc_ws).unwrap_or_default();
+    let case6_ok = dec_ws == text_ws;
+    ok &= case6_ok;
+
+    // Case 7: Special tokens
+    let text_spec = "<|im_start|>hello<|endoftext|>";
+    let enc_spec_allowed = tokenizer.encode(text_spec, true);
+    let case7_spec_allowed = enc_spec_allowed == vec![1, 261, 0];
+    let enc_spec_disallowed = tokenizer.encode(text_spec, false);
+    let case7_spec_disallowed = !enc_spec_disallowed.is_empty() && enc_spec_disallowed[0] != 1;
+    let dec_spec = tokenizer.decode(&enc_spec_allowed).unwrap_or_default();
+    let case7_ok = case7_spec_allowed && case7_spec_disallowed && dec_spec == text_spec;
+    ok &= case7_ok;
+
+    // Case 8: 10 KB text payload roundtrip
+    let base_pattern = "SandyRust BPE tokenizer test payload! café München 🦀🚀 12345.\n";
+    let repeat_count = (10 * 1024 / base_pattern.len()) + 1;
+    let big_text = base_pattern.repeat(repeat_count);
+    let enc_big = tokenizer.encode(&big_text, false);
+    let dec_big = tokenizer.decode(&enc_big).unwrap_or_default();
+    let case8_ok = dec_big == big_text && big_text.len() >= 10 * 1024;
+    ok &= case8_ok;
+
+    // 4. Tokenizer cryptographic fingerprint
+    let fp = BpeTokenizer::fingerprint(syn_json.as_bytes(), None);
+    let fp_ok = fp != [0u8; 32];
+    ok &= fp_ok;
+
+    report(
+        "GX17-8",
+        "acceptance",
+        t0,
+        ok,
+        "Tokenizer golden vectors and roundtrip parity (specv3 §B10.1, §B11 GX17-8)",
+        "Byte-to-Unicode bijection; cap enforcement and negative error rejection; ASCII, contraction, UTF-8, emoji, whitespace, special token golden vectors; 10 KB roundtrip",
+        "Pure-Rust standard-library-only ByteLevel BPE tokenizer from tokenizer.json",
+        "Tokenization discrepancy, decode corruption, or missing special token support",
+        "gx17-8-bpe-tokenizer-v1".to_string(),
+        "import_profile",
+        "fp32",
+        "All 8 tokenizer test cases and negative bounds PASS".to_string(),
+        format!(
+            "bijection={bijection_ok} neg=(wp:{neg_wp_ok},norm:{neg_norm_ok},cap:{neg_cap_ok}) cases=(1:{case1_ok},2:{case2_ok},3:{case3_ok},4:{case4_ok},5:{case5_ok},6:{case6_ok},7:{case7_ok},8:{case8_ok}) fp={fp_ok}"
+        ),
+        0.0,
+        0.0,
+    )
+}
+
+/// Composite Gate GX17 report covering Phase I1, Phase I2, Phase I3, and Phase I4 deliverables.
 pub fn gx17() -> GateReport {
     let t0 = Instant::now();
     let r0 = gx17_0();
@@ -2561,30 +2826,32 @@ pub fn gx17() -> GateReport {
     let r3 = gx17_3();
     let r4 = gx17_4();
     let r6 = gx17_6();
+    let r8 = gx17_8();
 
     let ok = r0.status == "PASS"
         && r1.status == "PASS"
         && r2.status == "PASS"
         && r3.status == "PASS"
         && r4.status == "PASS"
-        && r6.status == "PASS";
+        && r6.status == "PASS"
+        && r8.status == "PASS";
 
     report(
         "GX17",
         "acceptance",
         t0,
         ok,
-        "Extension X17: External Pretrained Weight Import Phases I1 & I2 (specv3 §3.6, §13.2, GX17)",
-        "GX17-0 baseline untouched; GX17-1 negative suite; GX17-2 fuzz test; GX17-3 dtype conversion; GX17-4 synthetic roundtrip; GX17-6 identity binding",
-        "Pure-Rust safetensors reader, RIMP checkpoint format, and cryptographic hash bindings",
+        "Extension X17: External Pretrained Weight Import Phases I1-I4 (specv3 §3.6, §13.2, GX17)",
+        "GX17-0 baseline untouched; GX17-1 negative suite; GX17-2 fuzz test; GX17-3 dtype conversion; GX17-4 synthetic roundtrip; GX17-6 identity binding; GX17-8 BPE tokenizer",
+        "Pure-Rust safetensors reader, RIMP checkpoint format, and HuggingFace BPE tokenizer",
         "Regression, identity bypass, or baseline behavioral mutation",
-        "gx17-composite-v2".to_string(),
+        "gx17-composite-v3".to_string(),
         "reference_v2",
         "fp32",
-        "GX17-0, GX17-1, GX17-2, GX17-3, GX17-4, GX17-6 all PASS".to_string(),
+        "GX17-0, GX17-1, GX17-2, GX17-3, GX17-4, GX17-6, GX17-8 all PASS".to_string(),
         format!(
-            "GX17-0={} GX17-1={} GX17-2={} GX17-3={} GX17-4={} GX17-6={}",
-            r0.status, r1.status, r2.status, r3.status, r4.status, r6.status
+            "GX17-0={} GX17-1={} GX17-2={} GX17-3={} GX17-4={} GX17-6={} GX17-8={}",
+            r0.status, r1.status, r2.status, r3.status, r4.status, r6.status, r8.status
         ),
         0.0,
         0.0,
