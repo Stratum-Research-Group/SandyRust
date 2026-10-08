@@ -369,7 +369,12 @@ pub fn loss_and_grad<T: Float>(
     }
     let gf = &p.data[1 + 9 * cfg.n_layers];
     let (xf, invf) = rms_fwd(&x, n, d, gf, eps);
-    let logits = mm_bt(&xf, n, d, embed, vs);
+    let head_weight = if cfg.tied_embeddings {
+        embed
+    } else {
+        &p.data[2 + 9 * cfg.n_layers]
+    };
+    let logits = mm_bt(&xf, n, d, head_weight, vs);
 
     // ---------------- loss ----------------
     let mut loss_sum = T::ZERO;
@@ -407,8 +412,13 @@ pub fn loss_and_grad<T: Float>(
     }
 
     // ---------------- backward ----------------
-    let dxf = mm(&dlogits, n, vs, embed, d);
-    mm_at_acc(&dlogits, n, vs, &xf, d, &mut grads.data[0]); // head path of tied E
+    let dxf = mm(&dlogits, n, vs, head_weight, d);
+    if cfg.tied_embeddings {
+        mm_at_acc(&dlogits, n, vs, &xf, d, &mut grads.data[0]); // head path of tied E
+    } else {
+        let head_idx = 2 + 9 * cfg.n_layers;
+        mm_at_acc(&dlogits, n, vs, &xf, d, &mut grads.data[head_idx]); // separate W_head gradient
+    }
     let fb = 1 + 9 * cfg.n_layers;
     let mut dgf = vec![T::ZERO; d];
     let mut dx = rms_bwd(&x, n, d, gf, &invf, &dxf, &mut dgf);
@@ -637,7 +647,12 @@ pub fn forward_loss<T: Float>(
     }
     let gf = &p.data[1 + 9 * cfg.n_layers];
     let (xf, _) = rms_fwd(&x, n, d, gf, eps);
-    let logits = mm_bt(&xf, n, d, embed, vs);
+    let head_weight = if cfg.tied_embeddings {
+        embed
+    } else {
+        &p.data[2 + 9 * cfg.n_layers]
+    };
+    let logits = mm_bt(&xf, n, d, head_weight, vs);
 
     let mut loss_sum = T::ZERO;
     let mut n_valid = 0usize;
