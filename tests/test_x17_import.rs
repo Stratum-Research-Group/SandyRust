@@ -69,14 +69,57 @@ fn test_gx17_6_identity_and_binding() {
 }
 
 #[test]
+fn test_gx17_5_offline_fixture_or_not_run() {
+    let rep = sandy_rust::import::gx17_5();
+    assert!(rep.status == "PASS" || rep.status == "NOT_RUN");
+    assert_eq!(rep.gate_id, "GX17-5");
+    assert_eq!(rep.scope, "acceptance");
+}
+
+#[test]
+fn test_gx17_7_memory_budget_and_caps() {
+    let rep = sandy_rust::import::gx17_7();
+    assert_eq!(rep.status, "PASS");
+    assert_eq!(rep.gate_id, "GX17-7");
+    assert_eq!(rep.scope, "acceptance");
+}
+
+#[test]
+fn test_gx17_9_generation_smoke() {
+    let rep = sandy_rust::import::gx17_9();
+    assert_eq!(rep.status, "PASS");
+    assert_eq!(rep.gate_id, "GX17-9");
+    assert_eq!(rep.scope, "smoke");
+}
+
+#[test]
+fn test_run_parity_check_on_synthetic_model() {
+    let (cfg_json, sf_bytes) = sandy_rust::import::build_synthetic_llama_safetensors();
+    let model = sandy_rust::import::remap_safetensors_from_bytes(cfg_json.as_bytes(), &sf_bytes, Some(64)).unwrap();
+    let prompts = vec![vec![0u32, 5, 2], vec![1u32, 3]];
+    let fixture_str = sandy_rust::import::generate_parity_fixture(&model, &prompts, 4, "synthetic/test", "commit123").unwrap();
+
+    let report = sandy_rust::import::run_parity_check(&model, fixture_str.as_bytes(), 1e-4).unwrap();
+    assert!(report.passed);
+    assert_eq!(report.num_cases_evaluated, 2);
+    assert_eq!(report.top1_matches, 2);
+    assert_eq!(report.greedy_continuation_matches, 2);
+    assert!(report.max_abs_logit_diff < 1e-5);
+}
+
+#[test]
 fn test_gx17_runner_dispatch() {
     let reps = gates::run(&[
-        "gx17", "gx17_0", "gx17_1", "gx17_2", "gx17_3", "gx17_4", "gx17_6", "gx17_8",
+        "gx17", "gx17_0", "gx17_1", "gx17_2", "gx17_3", "gx17_4", "gx17_5", "gx17_6", "gx17_7", "gx17_8", "gx17_9",
     ])
     .unwrap();
-    assert_eq!(reps.len(), 8);
+    assert_eq!(reps.len(), 11);
     for r in reps {
-        assert_eq!(r.status, "PASS", "Gate {} failed", r.gate_id);
+        if r.gate_id == "GX17-5" {
+            assert!(r.status == "PASS" || r.status == "NOT_RUN", "GX17-5 unexpected status {}", r.status);
+        } else {
+            assert_eq!(r.status, "PASS", "Gate {} failed", r.gate_id);
+        }
     }
 }
 
@@ -494,6 +537,57 @@ fn test_import_inspect_and_generation_with_bpe() {
     let gen_out = sandy_rust::generation::generate(&loaded_model, &model_prompt, &params).unwrap();
     assert_eq!(gen_out.tokens.len(), 4);
     assert!(gen_out.tokens.iter().all(|&t| t < 16));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_synthetic_generation_32_tokens() {
+    let (cfg_json, sf_bytes) = sandy_rust::import::build_synthetic_llama_safetensors();
+    let model = sandy_rust::import::remap_safetensors_from_bytes(cfg_json.as_bytes(), &sf_bytes, Some(64)).unwrap();
+    let prompt = [0u32, 5, 2];
+    let params = sandy_rust::generation::SamplingParams {
+        temperature: 0.0,
+        top_k: usize::MAX,
+        top_p: 1.0,
+        max_new_tokens: 32,
+        seed: 0,
+        adaptive: None,
+    };
+    let out = sandy_rust::generation::generate(&model, &prompt, &params).unwrap();
+    assert_eq!(out.tokens.len(), 32);
+    assert_eq!(&out.tokens[..8], &[15, 15, 15, 15, 15, 15, 15, 15]);
+}
+
+#[test]
+fn test_import_parity_cli_flow() {
+    let tmp = std::env::temp_dir().join(format!("sandy_parity_cli_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let (cfg_json, sf_bytes) = sandy_rust::import::build_synthetic_llama_safetensors();
+    std::fs::write(tmp.join("config.json"), &cfg_json).unwrap();
+    std::fs::write(tmp.join("model.safetensors"), &sf_bytes).unwrap();
+
+    let (model, manifest) = sandy_rust::import::import_model(&tmp, Some(64)).unwrap();
+    let rimp_path = tmp.join("model.rimp");
+    sandy_rust::import::save_rimp(&rimp_path, &model, manifest.fingerprint(), [0u8; 32]).unwrap();
+
+    let prompts = vec![vec![0u32, 5, 2], vec![1u32, 3]];
+    let fixture_str = sandy_rust::import::generate_parity_fixture(&model, &prompts, 4, "test_repo", "test_commit").unwrap();
+    let fixture_path = tmp.join("fixture.json");
+    std::fs::write(&fixture_path, &fixture_str).unwrap();
+
+    let loaded_model = sandy_rust::import::load_rimp(&rimp_path, None, 64 * 1024 * 1024).unwrap();
+    let fixture_bytes = std::fs::read(&fixture_path).unwrap();
+    let report = sandy_rust::import::run_parity_check(&loaded_model, &fixture_bytes, 1e-3).unwrap();
+
+    assert!(report.passed);
+    assert_eq!(report.donor_repo_id, "test_repo");
+    assert_eq!(report.donor_commit, "test_commit");
+    assert_eq!(report.num_cases_evaluated, 2);
+    assert_eq!(report.top1_matches, 2);
+    assert_eq!(report.greedy_continuation_matches, 2);
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -8,7 +8,7 @@
   "implemented_check": "Future attention weights exactly 0, padded query output 0 without non-finite multiplication, rank-1 rejected",
   "prerequisites": "Self-attention reference",
   "exclusions": "Bidirectional attention",
-  "revision": "bfd913b",
+  "revision": "c0ce074",
   "dirty_state": true,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
@@ -22,5 +22,5 @@
   "observed": "future=true pad=true rank_err=true",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 12
+  "execution_time_ms": 13
 }

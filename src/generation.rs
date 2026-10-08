@@ -171,8 +171,12 @@ pub struct GenerationOutput {
     pub adaptive_state: Option<AdaptiveSamplerState>,
 }
 
-fn disallowed(id: usize) -> bool {
-    id == BOS as usize || id == PAD as usize
+fn disallowed(id: usize, vocab_len: usize) -> bool {
+    if vocab_len == 259 {
+        id == BOS as usize || id == PAD as usize
+    } else {
+        false
+    }
 }
 
 /// Choose the next token from raw logits, updating adaptive sampler state if active.
@@ -197,11 +201,12 @@ pub fn sample_next_step(
             }
         }
     }
+    let v_len = logits.len();
     if p.temperature == 0.0 {
         // Greedy: bypasses softmax/top-k/top-p and consumes no PRNG state.
         let mut best: Option<usize> = None;
         for (i, &z) in logits.iter().enumerate() {
-            if disallowed(i) {
+            if disallowed(i, v_len) {
                 continue;
             }
             if best.is_none_or(|b| z > logits[b]) {
@@ -211,7 +216,7 @@ pub fn sample_next_step(
         return best.map(|i| i as u32).ok_or(GenerationError::EmptyFilteredDistribution);
     }
 
-    let v_allowed = logits.iter().enumerate().filter(|(i, _)| !disallowed(*i)).count();
+    let v_allowed = logits.iter().enumerate().filter(|(i, _)| !disallowed(*i, v_len)).count();
     let v_allowed_f = v_allowed as f32;
     let h_max = if v_allowed_f > 1.0 { v_allowed_f.ln() } else { 1.0 };
 
@@ -238,13 +243,13 @@ pub fn sample_next_step(
     let max = logits
         .iter()
         .enumerate()
-        .filter(|(i, _)| !disallowed(*i))
+        .filter(|(i, _)| !disallowed(*i, v_len))
         .map(|(_, &z)| z)
         .fold(f32::NEG_INFINITY, f32::max);
     let mut cand: Vec<(usize, f32)> = logits
         .iter()
         .enumerate()
-        .filter(|(i, _)| !disallowed(*i))
+        .filter(|(i, _)| !disallowed(*i, v_len))
         .map(|(i, &z)| (i, ((z - max) / t_eff).exp()))
         .collect();
     if cand.is_empty() {
@@ -378,7 +383,12 @@ pub fn generate(model: &Model, prompt: &[u32], p: &SamplingParams) -> Result<Gen
         let pos = seq.len() - 1;
         last_logits = logits.data()[pos * v..(pos + 1) * v].to_vec();
         let next = sample_next_step(&last_logits, p, &mut adaptive_state, &mut rng, pos)?;
-        if next == EOS {
+        let eos_id = if model.cfg.ext_x17_import {
+            model.cfg.eos_id
+        } else {
+            EOS
+        };
+        if next == eos_id {
             eos = true;
             break;
         }

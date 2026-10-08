@@ -335,6 +335,72 @@ fn main() -> ExitCode {
 
             ExitCode::SUCCESS
         }
+        Some("import-parity") => {
+            let import_path = match flag(&args, "--import") {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    eprintln!("missing required flag --import <file.rimp>");
+                    return ExitCode::from(2);
+                }
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let fixture_path = match flag(&args, "--fixture") {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    eprintln!("missing required flag --fixture <file.json>");
+                    return ExitCode::from(2);
+                }
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            let atol: f32 = match parse_flag(&args, "--atol", 1e-3f32) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+
+            let model = match sandy_rust::import::load_rimp(Path::new(import_path), None, 1024 * 1024 * 1024) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("failed to load RIMP model: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let fixture_bytes = match fs::read(fixture_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("failed to read fixture file: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let report = match sandy_rust::import::run_parity_check(&model, &fixture_bytes, atol) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("parity check execution failed: {e:?}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            println!("--- Extension X17 Parity Check Report ---");
+            println!("Donor Repo:                  {}", report.donor_repo_id);
+            println!("Donor Commit:                {}", report.donor_commit);
+            println!("Test Cases Evaluated:        {}", report.num_cases_evaluated);
+            println!("Max Absolute Logit Diff:     {:e}", report.max_abs_logit_diff);
+            println!("Tolerance (atol):            {:e}", report.atol);
+            println!("Top-1 Agreement:             {}/{}", report.top1_matches, report.total_top1_expected);
+            println!("Greedy Continuation Matches: {}/{}", report.greedy_continuation_matches, report.total_greedy_expected);
+            println!("Status:                      {}", if report.passed { "PASS" } else { "FAIL" });
+
+            if let Some(ref reason) = report.failure_reason {
+                eprintln!("Failure reason: {reason}");
+            }
+
+            if report.passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Some("checkpoint") => {
             let init_path = match flag(&args, "--init") {
                 Ok(v) => v,
@@ -921,6 +987,7 @@ fn main() -> ExitCode {
             eprintln!("  verify      [--gates <list>|all|baseline] [--artifacts <dir>]");
             eprintln!("  import      --model-dir <dir> --out <file.rimp>");
             eprintln!("  import-inspect --model-dir <dir>");
+            eprintln!("  import-parity --import <file.rimp> --fixture <file.json> [--atol f]");
             eprintln!("  train       [--steps n] [--lr f] [--dataset path] [--save-state path] [--resume path] [--checkpoint path] [--val-every n]");
             eprintln!("  gradcheck");
             eprintln!("  checkpoint  --init <path> | --inspect <path>");

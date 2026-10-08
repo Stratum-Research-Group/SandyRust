@@ -8,7 +8,7 @@
   "implemented_check": "Byte-to-Unicode bijection; cap enforcement and negative error rejection; ASCII, contraction, UTF-8, emoji, whitespace, special token golden vectors; 10 KB roundtrip",
   "prerequisites": "Pure-Rust standard-library-only ByteLevel BPE tokenizer from tokenizer.json",
   "exclusions": "Tokenization discrepancy, decode corruption, or missing special token support",
-  "revision": "3449e90",
+  "revision": "c0ce074",
   "dirty_state": true,
   "toolchain": "rustc-1.85.0-x86_64-unknown-linux-gnu",
   "target": "x86_64-unknown-linux-gnu",
