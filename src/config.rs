@@ -40,6 +40,7 @@ pub struct Config {
     pub seed: u64,
     pub ext_x1_gqa: bool,
     pub ext_x2_untied_embeddings: bool,
+    pub ext_x3_qk_norm: bool,
     pub ext_x13_hooks: bool,
     pub ext_x13_edit: bool,
     pub ext_x12e_entropy_sampling: bool,
@@ -80,6 +81,7 @@ impl Config {
             seed: 0x5EED_5A9D,
             ext_x1_gqa: false,
             ext_x2_untied_embeddings: false,
+            ext_x3_qk_norm: false,
             ext_x13_hooks: false,
             ext_x13_edit: false,
             ext_x12e_entropy_sampling: false,
@@ -128,13 +130,20 @@ impl Config {
         c
     }
 
+    /// QK-Norm scaling profile (§4.2 Item 3): MHA, tied, P = 887,296 (+1,024 params).
+    pub fn qk_norm_v2() -> Self {
+        let mut c = Self::reference_v2();
+        c.ext_x3_qk_norm = true;
+        c
+    }
+
     pub fn head_dim(&self) -> usize {
         self.d_model.checked_div(self.n_q_heads).unwrap_or(0)
     }
 
     /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
     pub fn fingerprint(&self) -> [u8; 32] {
-        let s = if !self.ext_x1_gqa && !self.ext_x2_untied_embeddings && !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
+        let s = if !self.ext_x1_gqa && !self.ext_x2_untied_embeddings && !self.ext_x3_qk_norm && !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
             format!(
                 "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
@@ -144,12 +153,12 @@ impl Config {
             )
         } else {
             format!(
-                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x1g{}:x2u{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x1g{}:x2u{}:x3q{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
                 self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
                 self.batch_size, self.rope_theta.to_bits(), self.rms_eps.to_bits(),
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed,
-                self.ext_x1_gqa, self.ext_x2_untied_embeddings, self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
+                self.ext_x1_gqa, self.ext_x2_untied_embeddings, self.ext_x3_qk_norm, self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
             )
         };
         crate::sha256::sha256(s.as_bytes())
@@ -260,13 +269,16 @@ impl Config {
         let dh = self.head_dim();
         let kv = self.n_kv_heads.checked_mul(dh)?;
         let q = self.n_q_heads.checked_mul(dh)?;
-        let per_layer = d // rms1
+        let mut per_layer = d // rms1
             .checked_add(d.checked_mul(q)?)? // Wq
             .checked_add(d.checked_mul(kv)?)? // Wk
             .checked_add(d.checked_mul(kv)?)? // Wv
             .checked_add(q.checked_mul(d)?)? // Wo
             .checked_add(d)? // rms2
             .checked_add(d.checked_mul(self.d_ff)?.checked_mul(3)?)?; // gate+up+down
+        if self.ext_x3_qk_norm {
+            per_layer = per_layer.checked_add(q)?.checked_add(kv)?;
+        }
         let embed = self.vocab_size.checked_mul(d)?;
         let mut total = embed
             .checked_add(per_layer.checked_mul(self.n_layers)?)?
@@ -287,6 +299,23 @@ mod tests {
         let c = Config::reference_v2();
         c.validate().unwrap();
         assert_eq!(c.param_count(), Some(886_272));
+    }
+
+    #[test]
+    fn qk_norm_counts() {
+        let c_mha = Config::qk_norm_v2();
+        assert_eq!(c_mha.param_count(), Some(887_296));
+        assert!(c_mha.validate().is_ok());
+
+        let mut c_gqa = Config::gqa_v2();
+        c_gqa.ext_x3_qk_norm = true;
+        assert_eq!(c_gqa.param_count(), Some(821_504));
+        assert!(c_gqa.validate().is_ok());
+
+        let mut c_mqa = Config::mqa_v2();
+        c_mqa.ext_x3_qk_norm = true;
+        assert_eq!(c_mqa.param_count(), Some(788_608));
+        assert!(c_mqa.validate().is_ok());
     }
 
     #[test]

@@ -275,16 +275,22 @@ pub fn forward_step_with_hooks(
         let mut v_staged = Tensor::zeros(&[1, kv_dim])?;
         for kvh in 0..c.n_kv_heads {
             let k_col = slice_cols(&k, kvh * dh, dh)?;
+            let k_normed = if let Some(ref kn) = l.k_norm {
+                let gamma_kvh = crate::attention::qknorm::slice_row(kn, kvh)?;
+                rms_norm(&k_col, &gamma_kvh, c.rms_eps)?
+            } else {
+                k_col
+            };
 
             // Site 4b: KPreRope
             if let Some(hook_ctx) = ctx {
                 let hook = crate::hooks::HookId::head(layer_u16, crate::hooks::HookSite::KPreRope, kvh as u16);
                 if let Some(ref mut s) = sink {
-                    crate::hooks::apply_records(&hook, &k_col, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+                    crate::hooks::apply_records(&hook, &k_normed, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
                 }
             }
 
-            let mut col_r = rope(&k_col, c.rope_theta, pos)?;
+            let mut col_r = rope(&k_normed, c.rope_theta, pos)?;
 
             // Site 4c: K
             if let Some(hook_ctx) = ctx {
@@ -339,7 +345,14 @@ pub fn forward_step_with_hooks(
         let mut merged = Tensor::zeros(&[1, c.n_q_heads * dh])?;
         for h in 0..c.n_q_heads {
             let kvh = h / group;
-            let mut qh = rope(&slice_cols(&q, h * dh, dh)?, c.rope_theta, pos)?;
+            let q_col = slice_cols(&q, h * dh, dh)?;
+            let q_normed = if let Some(ref qn) = l.q_norm {
+                let gamma_h = crate::attention::qknorm::slice_row(qn, h)?;
+                rms_norm(&q_col, &gamma_h, c.rms_eps)?
+            } else {
+                q_col
+            };
+            let mut qh = rope(&q_normed, c.rope_theta, pos)?;
 
             // Site 4a: Q
             if let Some(hook_ctx) = ctx {

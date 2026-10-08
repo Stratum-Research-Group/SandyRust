@@ -40,6 +40,8 @@ pub struct Layer {
     pub wq: Tensor,
     pub wk: Tensor,
     pub wv: Tensor,
+    pub q_norm: Option<Tensor>,
+    pub k_norm: Option<Tensor>,
     pub wo: Tensor,
     pub rms2: Tensor,
     pub w_gate: Tensor,
@@ -67,6 +69,10 @@ pub fn inventory(cfg: &Config) -> Vec<(String, Vec<usize>)> {
         v.push((p("wq"), vec![d, q]));
         v.push((p("wk"), vec![d, kv]));
         v.push((p("wv"), vec![d, kv]));
+        if cfg.ext_x3_qk_norm {
+            v.push((p("q_norm"), vec![cfg.n_q_heads, dh]));
+            v.push((p("k_norm"), vec![cfg.n_kv_heads, dh]));
+        }
         v.push((p("wo"), vec![q, d]));
         v.push((p("rms2"), vec![d]));
         v.push((p("w_gate"), vec![d, cfg.d_ff]));
@@ -101,6 +107,15 @@ fn slice_cols(t: &Tensor, start: usize, len: usize) -> Result<Tensor, TensorErro
     Tensor::from_vec(&[rows, len], out)
 }
 
+fn slice_row(t: &Tensor, row: usize) -> Result<Tensor, TensorError> {
+    let (rows, cols) = (t.shape()[0], t.shape()[1]);
+    if row >= rows {
+        return Err(TensorError::InvalidArgument("slice_row out of bounds"));
+    }
+    let start = row * cols;
+    Tensor::from_vec(&[cols], t.data()[start..start + cols].to_vec())
+}
+
 impl Model {
     /// Seeded random initialisation per §3.5.
     pub fn init(cfg: &Config) -> Result<Self, ModelError> {
@@ -111,7 +126,7 @@ impl Model {
         for (name, shape) in inventory(cfg) {
             let leaf = name.rsplit('.').next().unwrap_or(&name);
             let t = match leaf {
-                "rms1" | "rms2" | "final_norm" => ones(&shape)?,
+                "rms1" | "rms2" | "final_norm" | "q_norm" | "k_norm" => ones(&shape)?,
                 "wo" | "w_down" => normal_tensor(&shape, 0.02 * resid, &mut rng)?,
                 _ => normal_tensor(&shape, 0.02, &mut rng)?,
             };
@@ -137,8 +152,22 @@ impl Model {
         let mut layers = Vec::new();
         for _ in 0..cfg.n_layers {
             let mut n = || it.next().unwrap();
+            let rms1 = n();
+            let wq = n();
+            let wk = n();
+            let wv = n();
+            let (q_norm, k_norm) = if cfg.ext_x3_qk_norm {
+                (Some(n()), Some(n()))
+            } else {
+                (None, None)
+            };
+            let wo = n();
+            let rms2 = n();
+            let w_gate = n();
+            let w_up = n();
+            let w_down = n();
             layers.push(Layer {
-                rms1: n(), wq: n(), wk: n(), wv: n(), wo: n(), rms2: n(), w_gate: n(), w_up: n(), w_down: n(),
+                rms1, wq, wk, wv, q_norm, k_norm, wo, rms2, w_gate, w_up, w_down,
             });
         }
         let final_norm = it.next().unwrap();
@@ -159,7 +188,14 @@ impl Model {
         let names = inventory(&self.cfg);
         let mut refs: Vec<&Tensor> = vec![&self.embed];
         for l in &self.layers {
-            refs.extend([&l.rms1, &l.wq, &l.wk, &l.wv, &l.wo, &l.rms2, &l.w_gate, &l.w_up, &l.w_down]);
+            refs.extend([&l.rms1, &l.wq, &l.wk, &l.wv]);
+            if let Some(ref qn) = l.q_norm {
+                refs.push(qn);
+            }
+            if let Some(ref kn) = l.k_norm {
+                refs.push(kn);
+            }
+            refs.extend([&l.wo, &l.rms2, &l.w_gate, &l.w_up, &l.w_down]);
         }
         refs.push(&self.final_norm);
         if let Some(ref h) = self.lm_head {
@@ -278,7 +314,13 @@ impl Model {
             for h in 0..c.n_q_heads {
                 let kvh = h / group;
                 let q_col = slice_cols(&q, h * dh, dh)?;
-                let mut qh = rope(&q_col, c.rope_theta, 0)?;
+                let q_normed = if let Some(ref qn) = l.q_norm {
+                    let gamma_h = slice_row(qn, h)?;
+                    rms_norm(&q_col, &gamma_h, c.rms_eps)?
+                } else {
+                    q_col
+                };
+                let mut qh = rope(&q_normed, c.rope_theta, 0)?;
 
                 // Site 4a: Q
                 if let Some(hook_ctx) = ctx {
@@ -295,16 +337,22 @@ impl Model {
                 }
 
                 let k_col = slice_cols(&k, kvh * dh, dh)?;
+                let k_normed = if let Some(ref kn) = l.k_norm {
+                    let gamma_kvh = slice_row(kn, kvh)?;
+                    rms_norm(&k_col, &gamma_kvh, c.rms_eps)?
+                } else {
+                    k_col
+                };
 
                 // Site 4b: KPreRope
                 if let Some(hook_ctx) = ctx {
                     let hook = crate::hooks::HookId::head(layer_u16, crate::hooks::HookSite::KPreRope, kvh as u16);
                     if let Some(ref mut s) = sink {
-                        crate::hooks::apply_records(&hook, &k_col, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
+                        crate::hooks::apply_records(&hook, &k_normed, crate::hooks::RecordTiming::PostEdit, &hook_ctx.records, s)?;
                     }
                 }
 
-                let mut kh = rope(&k_col, c.rope_theta, 0)?;
+                let mut kh = rope(&k_normed, c.rope_theta, 0)?;
 
                 // Site 4c: K
                 if let Some(hook_ctx) = ctx {

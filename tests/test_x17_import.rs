@@ -282,6 +282,7 @@ fn test_rimp_serialize_deserialize_roundtrip() {
         seed: 42,
         ext_x1_gqa: false,
         ext_x2_untied_embeddings: false,
+        ext_x3_qk_norm: false,
         ext_x13_hooks: false,
         ext_x13_edit: false,
         ext_x12e_entropy_sampling: false,
