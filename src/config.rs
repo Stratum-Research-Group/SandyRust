@@ -38,6 +38,7 @@ pub struct Config {
     pub pad_id: u32,
     pub tied_embeddings: bool,
     pub seed: u64,
+    pub ext_x1_gqa: bool,
     pub ext_x13_hooks: bool,
     pub ext_x13_edit: bool,
     pub ext_x12e_entropy_sampling: bool,
@@ -76,6 +77,7 @@ impl Config {
             pad_id: 258,
             tied_embeddings: true,
             seed: 0x5EED_5A9D,
+            ext_x1_gqa: false,
             ext_x13_hooks: false,
             ext_x13_edit: false,
             ext_x12e_entropy_sampling: false,
@@ -84,13 +86,29 @@ impl Config {
         }
     }
 
+    /// GQA scaling profile (§4.2 Item 1): H_q = 4, H_kv = 2, tied, P = 820,736.
+    pub fn gqa_v2() -> Self {
+        let mut c = Self::reference_v2();
+        c.ext_x1_gqa = true;
+        c.n_kv_heads = 2;
+        c
+    }
+
+    /// MQA scaling profile (§4.2 Item 1): H_q = 4, H_kv = 1, tied, P = 787,968.
+    pub fn mqa_v2() -> Self {
+        let mut c = Self::reference_v2();
+        c.ext_x1_gqa = true;
+        c.n_kv_heads = 1;
+        c
+    }
+
     pub fn head_dim(&self) -> usize {
         self.d_model.checked_div(self.n_q_heads).unwrap_or(0)
     }
 
     /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
     pub fn fingerprint(&self) -> [u8; 32] {
-        let s = if !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
+        let s = if !self.ext_x1_gqa && !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
             format!(
                 "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
@@ -100,12 +118,12 @@ impl Config {
             )
         } else {
             format!(
-                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x1g{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
                 self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
                 self.batch_size, self.rope_theta.to_bits(), self.rms_eps.to_bits(),
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed,
-                self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
+                self.ext_x1_gqa, self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
             )
         };
         crate::sha256::sha256(s.as_bytes())
@@ -202,7 +220,7 @@ impl Config {
             if !self.tied_embeddings {
                 return Err(ConfigError::ExtensionNotEnabled("tied_embeddings=false is extension X2, disabled in baseline"));
             }
-            if self.n_kv_heads != self.n_q_heads {
+            if !self.ext_x1_gqa && self.n_kv_heads != self.n_q_heads {
                 return Err(ConfigError::ExtensionNotEnabled("n_kv_heads != n_q_heads is extension X1 (GQA/MQA), disabled in baseline"));
             }
         }

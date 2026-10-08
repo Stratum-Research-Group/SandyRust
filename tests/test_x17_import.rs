@@ -280,6 +280,7 @@ fn test_rimp_serialize_deserialize_roundtrip() {
         pad_id: 2,
         tied_embeddings: false, // test untied lm_head as well
         seed: 42,
+        ext_x1_gqa: false,
         ext_x13_hooks: false,
         ext_x13_edit: false,
         ext_x12e_entropy_sampling: false,

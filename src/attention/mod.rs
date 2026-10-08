@@ -4,6 +4,9 @@
 use crate::tensor::ops::masked_softmax_row;
 use crate::tensor::{Tensor, TensorError};
 
+pub mod gqa;
+pub use gqa::{attention_gqa, gx1, repeat_kv_heads};
+
 /// `q:[Tq,dh]`, `k,v:[Tk,dh]`. Padded queries output exact zero; a valid query with
 /// every key masked returns `AllMaskedRow`. Returns `(output, probabilities[Tq*Tk])`.
 pub fn attention_ref(

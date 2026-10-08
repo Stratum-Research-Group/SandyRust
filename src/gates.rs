@@ -766,6 +766,7 @@ pub fn run(ids: &[&str]) -> Result<Vec<GateReport>, String> {
             "g12" => g12(),
             "g13" => g13(),
             "g14" => g14(),
+            "gx1" => crate::attention::gx1(),
             "gx12e" => crate::generation::gx12e(),
             "gx13" => crate::hooks::gx13(),
             "gx14" => crate::eval::gx14(),
