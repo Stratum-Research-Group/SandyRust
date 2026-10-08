@@ -20,6 +20,43 @@ impl fmt::Display for ConfigError {
 }
 impl std::error::Error for ConfigError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeScalingType {
+    Linear,
+    Yarn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RopeScalingConfig {
+    pub scaling_type: RopeScalingType,
+    pub train_context: usize,
+    pub target_context: usize,
+    pub yarn_alpha: f32,
+    pub yarn_beta: f32,
+}
+
+impl RopeScalingConfig {
+    pub fn linear(train_context: usize, target_context: usize) -> Self {
+        Self {
+            scaling_type: RopeScalingType::Linear,
+            train_context,
+            target_context,
+            yarn_alpha: 1.0,
+            yarn_beta: 32.0,
+        }
+    }
+
+    pub fn yarn(train_context: usize, target_context: usize) -> Self {
+        Self {
+            scaling_type: RopeScalingType::Yarn,
+            train_context,
+            target_context,
+            yarn_alpha: 1.0,
+            yarn_beta: 32.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub schema_version: u32,
@@ -41,6 +78,8 @@ pub struct Config {
     pub ext_x1_gqa: bool,
     pub ext_x2_untied_embeddings: bool,
     pub ext_x3_qk_norm: bool,
+    pub ext_x4_rope: bool,
+    pub rope_scaling: Option<RopeScalingConfig>,
     pub ext_x13_hooks: bool,
     pub ext_x13_edit: bool,
     pub ext_x12e_entropy_sampling: bool,
@@ -82,6 +121,8 @@ impl Config {
             ext_x1_gqa: false,
             ext_x2_untied_embeddings: false,
             ext_x3_qk_norm: false,
+            ext_x4_rope: false,
+            rope_scaling: None,
             ext_x13_hooks: false,
             ext_x13_edit: false,
             ext_x12e_entropy_sampling: false,
@@ -137,13 +178,31 @@ impl Config {
         c
     }
 
+    /// YaRN RoPE context extension profile (§4.2 Item 4): MHA, tied, extended target context.
+    pub fn rope_yarn_v2(target_context: usize) -> Self {
+        let mut c = Self::reference_v2();
+        c.ext_x4_rope = true;
+        c.max_seq_len = target_context;
+        c.rope_scaling = Some(RopeScalingConfig::yarn(64, target_context));
+        c
+    }
+
+    /// Linear RoPE context extension profile (§4.2 Item 4): MHA, tied, extended target context.
+    pub fn rope_linear_v2(target_context: usize) -> Self {
+        let mut c = Self::reference_v2();
+        c.ext_x4_rope = true;
+        c.max_seq_len = target_context;
+        c.rope_scaling = Some(RopeScalingConfig::linear(64, target_context));
+        c
+    }
+
     pub fn head_dim(&self) -> usize {
         self.d_model.checked_div(self.n_q_heads).unwrap_or(0)
     }
 
     /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
     pub fn fingerprint(&self) -> [u8; 32] {
-        let s = if !self.ext_x1_gqa && !self.ext_x2_untied_embeddings && !self.ext_x3_qk_norm && !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
+        let s = if !self.ext_x1_gqa && !self.ext_x2_untied_embeddings && !self.ext_x3_qk_norm && !self.ext_x4_rope && !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
             format!(
                 "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
@@ -152,13 +211,17 @@ impl Config {
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed
             )
         } else {
+            let rs_str = match &self.rope_scaling {
+                None => "none".to_string(),
+                Some(rs) => format!("{:?}:{}:{}:{:.2}:{:.2}", rs.scaling_type, rs.train_context, rs.target_context, rs.yarn_alpha, rs.yarn_beta),
+            };
             format!(
-                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x1g{}:x2u{}:x3q{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x1g{}:x2u{}:x3q{}:x4r{}:{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
                 self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
                 self.batch_size, self.rope_theta.to_bits(), self.rms_eps.to_bits(),
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed,
-                self.ext_x1_gqa, self.ext_x2_untied_embeddings, self.ext_x3_qk_norm, self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
+                self.ext_x1_gqa, self.ext_x2_untied_embeddings, self.ext_x3_qk_norm, self.ext_x4_rope, rs_str, self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
             )
         };
         crate::sha256::sha256(s.as_bytes())
@@ -257,6 +320,21 @@ impl Config {
             }
             if !self.ext_x1_gqa && self.n_kv_heads != self.n_q_heads {
                 return Err(ConfigError::ExtensionNotEnabled("n_kv_heads != n_q_heads is extension X1 (GQA/MQA), disabled in baseline"));
+            }
+        }
+
+        if self.rope_scaling.is_some() && !self.ext_x4_rope {
+            return Err(ConfigError::ExtensionNotEnabled("rope_scaling requires ext_x4_rope (extension X4)"));
+        }
+        if let Some(ref rs) = self.rope_scaling {
+            if rs.train_context == 0 || rs.target_context == 0 {
+                return Err(ConfigError::OutOfRange("rope_scaling contexts must be > 0"));
+            }
+            if rs.target_context < rs.train_context {
+                return Err(ConfigError::OutOfRange("target_context must be >= train_context"));
+            }
+            if !rs.yarn_alpha.is_finite() || rs.yarn_alpha < 0.0 || !rs.yarn_beta.is_finite() || rs.yarn_beta <= rs.yarn_alpha {
+                return Err(ConfigError::OutOfRange("yarn_alpha and yarn_beta invalid"));
             }
         }
 

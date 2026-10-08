@@ -6,8 +6,13 @@ use crate::tensor::{Tensor, TensorError};
 
 pub mod gqa;
 pub mod qknorm;
+pub mod rope_ext;
 pub use gqa::{attention_gqa, gx1, repeat_kv_heads};
 pub use qknorm::{apply_qk_norm_head, gx3};
+pub use rope_ext::{
+    adjacent_to_split, compute_frequencies, gx4, rope_split_with_freqs, rope_with_freqs,
+    split_to_adjacent, yarn_temperature_scale,
+};
 
 /// `q:[Tq,dh]`, `k,v:[Tk,dh]`. Padded queries output exact zero; a valid query with
 /// every key masked returns `AllMaskedRow`. Returns `(output, probabilities[Tq*Tk])`.
