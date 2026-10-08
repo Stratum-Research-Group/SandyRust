@@ -357,7 +357,7 @@ fn main() -> ExitCode {
                 Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
             };
 
-            let model = match sandy_rust::import::load_rimp(Path::new(import_path), None, 1024 * 1024 * 1024) {
+            let model = match sandy_rust::import::load_rimp(Path::new(import_path), None, sandy_rust::import::MAX_RIMP_FILE_CAP) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("failed to load RIMP model: {e:?}");
@@ -444,7 +444,7 @@ fn main() -> ExitCode {
             };
 
             let (model, bpe_opt) = if let Some(rimp_path) = import_flag {
-                let m = match sandy_rust::import::load_rimp(Path::new(rimp_path), None, 512 * 1024 * 1024) {
+                let m = match sandy_rust::import::load_rimp(Path::new(rimp_path), None, sandy_rust::import::MAX_RIMP_FILE_CAP) {
                     Ok(m) => m,
                     Err(e) => {
                         eprintln!("import load rejected: {e:?}");

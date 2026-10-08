@@ -27,6 +27,7 @@ pub const HEADER_TENSOR_CAP: usize = 4096; // Maximum tensor count in header
 pub const MAX_SAFELENSORS_FILE_CAP: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 pub const MAX_JSON_STRING_LEN: usize = 4096; // Maximum length of any string
 pub const MAX_JSON_DEPTH: usize = 4; // Maximum allowed nesting depth
+pub const MAX_RIMP_FILE_CAP: usize = MAX_IMPORT_PARAM_BYTES_CAP + (64 * 1024 * 1024); // ~1.06 GiB
 
 /// Extension X17 errors (additive enum per §B9).
 #[derive(Debug, Clone, PartialEq)]
@@ -3188,7 +3189,7 @@ pub fn gx17_5() -> GateReport {
         };
     }
 
-    let model = match load_rimp(rimp_p, None, 1024 * 1024 * 1024) {
+    let model = match load_rimp(rimp_p, None, MAX_RIMP_FILE_CAP) {
         Ok(m) => m,
         Err(e) => {
             return report(
