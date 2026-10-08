@@ -285,6 +285,7 @@ fn test_rimp_serialize_deserialize_roundtrip() {
         ext_x3_qk_norm: false,
         ext_x4_rope: false,
         rope_scaling: None,
+        ext_x5_gemm: false,
         ext_x13_hooks: false,
         ext_x13_edit: false,
         ext_x12e_entropy_sampling: false,

@@ -9,6 +9,7 @@ pub mod data;
 pub mod embedding;
 pub mod eval;
 pub mod gates;
+pub mod gemm;
 pub mod generation;
 pub mod hooks;
 pub mod import;

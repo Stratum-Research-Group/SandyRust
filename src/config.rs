@@ -80,6 +80,7 @@ pub struct Config {
     pub ext_x3_qk_norm: bool,
     pub ext_x4_rope: bool,
     pub rope_scaling: Option<RopeScalingConfig>,
+    pub ext_x5_gemm: bool,
     pub ext_x13_hooks: bool,
     pub ext_x13_edit: bool,
     pub ext_x12e_entropy_sampling: bool,
@@ -123,6 +124,7 @@ impl Config {
             ext_x3_qk_norm: false,
             ext_x4_rope: false,
             rope_scaling: None,
+            ext_x5_gemm: false,
             ext_x13_hooks: false,
             ext_x13_edit: false,
             ext_x12e_entropy_sampling: false,
@@ -196,13 +198,20 @@ impl Config {
         c
     }
 
+    /// Optimized CPU GEMM profile (§4.2 Item 5): MHA, tied.
+    pub fn gemm_opt_v2() -> Self {
+        let mut c = Self::reference_v2();
+        c.ext_x5_gemm = true;
+        c
+    }
+
     pub fn head_dim(&self) -> usize {
         self.d_model.checked_div(self.n_q_heads).unwrap_or(0)
     }
 
     /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
     pub fn fingerprint(&self) -> [u8; 32] {
-        let s = if !self.ext_x1_gqa && !self.ext_x2_untied_embeddings && !self.ext_x3_qk_norm && !self.ext_x4_rope && !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
+        let s = if !self.ext_x1_gqa && !self.ext_x2_untied_embeddings && !self.ext_x3_qk_norm && !self.ext_x4_rope && !self.ext_x5_gemm && !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
             format!(
                 "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
@@ -216,12 +225,12 @@ impl Config {
                 Some(rs) => format!("{:?}:{}:{}:{:.2}:{:.2}", rs.scaling_type, rs.train_context, rs.target_context, rs.yarn_alpha, rs.yarn_beta),
             };
             format!(
-                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x1g{}:x2u{}:x3q{}:x4r{}:{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x1g{}:x2u{}:x3q{}:x4r{}:{}:x5g{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
                 self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
                 self.batch_size, self.rope_theta.to_bits(), self.rms_eps.to_bits(),
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed,
-                self.ext_x1_gqa, self.ext_x2_untied_embeddings, self.ext_x3_qk_norm, self.ext_x4_rope, rs_str, self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
+                self.ext_x1_gqa, self.ext_x2_untied_embeddings, self.ext_x3_qk_norm, self.ext_x4_rope, rs_str, self.ext_x5_gemm, self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
             )
         };
         crate::sha256::sha256(s.as_bytes())
