@@ -8,8 +8,8 @@
   "implemented_check": "GX17-0 baseline untouched; GX17-1 negative suite; GX17-2 fuzz test; GX17-3 dtype conversion parity",
   "prerequisites": "Zero-crate pure-Rust safetensors reader and float decoders",
   "exclusions": "Regression or baseline behavioral mutation",
-  "revision": "83f5bba",
-  "dirty_state": true,
+  "revision": "c1e27fc",
+  "dirty_state": false,
   "toolchain": "rustc-1.85.0-x86_64-unknown-linux-gnu",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo test --test test_x17_import",
@@ -22,5 +22,5 @@
   "observed": "GX17-0=PASS GX17-1=PASS GX17-2=PASS GX17-3=PASS",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 13
+  "execution_time_ms": 14
 }
