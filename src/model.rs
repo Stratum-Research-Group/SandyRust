@@ -53,6 +53,7 @@ pub struct Model {
     pub embed: Tensor,
     pub layers: Vec<Layer>,
     pub final_norm: Tensor,
+    pub lm_head: Option<Tensor>,
 }
 
 /// Ordered `(name, shape)` inventory for a configuration (single source of truth for checkpoints).
@@ -73,6 +74,9 @@ pub fn inventory(cfg: &Config) -> Vec<(String, Vec<usize>)> {
         v.push((p("w_down"), vec![cfg.d_ff, d]));
     }
     v.push(("final_norm".to_string(), vec![d]));
+    if !cfg.tied_embeddings {
+        v.push(("lm_head".to_string(), vec![cfg.vocab_size, d]));
+    }
     v
 }
 
@@ -138,7 +142,12 @@ impl Model {
             });
         }
         let final_norm = it.next().unwrap();
-        Ok(Model { cfg: cfg.clone(), embed, layers, final_norm })
+        let lm_head = if !cfg.tied_embeddings {
+            Some(it.next().unwrap())
+        } else {
+            None
+        };
+        Ok(Model { cfg: cfg.clone(), embed, layers, final_norm, lm_head })
     }
 
     pub fn from_params(cfg: &Config, p: &crate::autodiff::Params<f32>) -> Result<Self, ModelError> {
@@ -153,6 +162,9 @@ impl Model {
             refs.extend([&l.rms1, &l.wq, &l.wk, &l.wv, &l.wo, &l.rms2, &l.w_gate, &l.w_up, &l.w_down]);
         }
         refs.push(&self.final_norm);
+        if let Some(ref h) = self.lm_head {
+            refs.push(h);
+        }
         names.into_iter().map(|(n, _)| n).zip(refs).collect()
     }
 
@@ -468,7 +480,11 @@ impl Model {
             }
         }
 
-        let mut logits = matmul(&final_x, &self.embed.transpose2d()?)?;
+        let head_mat = match &self.lm_head {
+            Some(h) => h,
+            None => &self.embed,
+        };
+        let mut logits = matmul(&final_x, &head_mat.transpose2d()?)?;
 
         // Site 12b: Logits
         if let Some(hook_ctx) = ctx {

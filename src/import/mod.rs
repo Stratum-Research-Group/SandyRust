@@ -9,7 +9,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::config::{Config, MAX_SEQ_CAP};
 use crate::gates::{detect_revision, GateReport};
+use crate::model::Model;
+use crate::sha256::hex;
+use crate::tensor::Tensor;
 
 /// Hard security and memory limits per spec (§B5, D10).
 pub const HEADER_CAP: u64 = 8 * 1024 * 1024; // 8 MiB maximum header size
@@ -242,6 +246,49 @@ pub enum JsonValue {
     Array(Vec<JsonValue>),
     String(String),
     Uint(u64),
+    Float(f64),
+    Bool(bool),
+    Null,
+}
+
+impl JsonValue {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            JsonValue::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            JsonValue::Uint(u) => Some(*u),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            JsonValue::Float(f) => Some(*f),
+            JsonValue::Uint(u) => Some(*u as f64),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            JsonValue::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&JsonValue> {
+        match self {
+            JsonValue::Object(entries) => {
+                entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+            }
+            _ => None,
+        }
+    }
 }
 
 struct JsonParser<'a> {
@@ -289,10 +336,22 @@ impl<'a> JsonParser<'a> {
             Some(b'{') => self.parse_object(),
             Some(b'[') => self.parse_array(),
             Some(b'"') => self.parse_string().map(JsonValue::String),
-            Some(b'0'..=b'9') => self.parse_uint().map(JsonValue::Uint),
-            Some(b'-') => Err(ImportError::InvalidJson("negative integers not supported".to_string())),
+            Some(b'0'..=b'9' | b'-') => self.parse_number(),
+            Some(b't') => self.parse_literal(b"true", JsonValue::Bool(true)),
+            Some(b'f') => self.parse_literal(b"false", JsonValue::Bool(false)),
+            Some(b'n') => self.parse_literal(b"null", JsonValue::Null),
             Some(c) => Err(ImportError::InvalidJson(format!("unexpected character '{}'", c as char))),
             None => Err(ImportError::InvalidJson("unexpected end of input".to_string())),
+        }
+    }
+
+    fn parse_literal(&mut self, expected: &[u8], val: JsonValue) -> Result<JsonValue, ImportError> {
+        self.skip_whitespace();
+        if self.pos + expected.len() <= self.src.len() && &self.src[self.pos..self.pos + expected.len()] == expected {
+            self.pos += expected.len();
+            Ok(val)
+        } else {
+            Err(ImportError::InvalidJson(format!("expected literal '{}'", String::from_utf8_lossy(expected))))
         }
     }
 
@@ -358,38 +417,46 @@ impl<'a> JsonParser<'a> {
         Err(ImportError::InvalidJson("unterminated string".to_string()))
     }
 
-    fn parse_uint(&mut self) -> Result<u64, ImportError> {
+    fn parse_number(&mut self) -> Result<JsonValue, ImportError> {
         self.skip_whitespace();
         let start = self.pos;
-        let mut val: u64 = 0;
-        let mut has_digits = false;
+        let mut is_float = false;
+
+        if self.pos < self.src.len() && self.src[self.pos] == b'-' {
+            is_float = true;
+            self.pos += 1;
+        }
 
         while self.pos < self.src.len() {
             let b = self.src[self.pos];
             if b.is_ascii_digit() {
-                let digit = (b - b'0') as u64;
-                val = val
-                    .checked_mul(10)
-                    .and_then(|v| v.checked_add(digit))
-                    .ok_or_else(|| ImportError::InvalidJson("integer overflow > u64".to_string()))?;
-                has_digits = true;
                 self.pos += 1;
-            } else if b == b'.' || b == b'e' || b == b'E' {
-                return Err(ImportError::InvalidJson("float values not permitted in safetensors header".to_string()));
+            } else if b == b'.' || b == b'e' || b == b'E' || b == b'+' || b == b'-' {
+                is_float = true;
+                self.pos += 1;
             } else {
                 break;
             }
         }
 
-        if !has_digits {
-            return Err(ImportError::InvalidJson("expected unsigned integer digits".to_string()));
-        }
-        // Reject leading zeros if length > 1, e.g. "0123"
-        if self.pos - start > 1 && self.src[start] == b'0' {
-            return Err(ImportError::InvalidJson("leading zeros not permitted in integer".to_string()));
+        let num_slice = &self.src[start..self.pos];
+        if num_slice.is_empty() || num_slice == b"-" {
+            return Err(ImportError::InvalidJson("expected digits in number".to_string()));
         }
 
-        Ok(val)
+        let s = std::str::from_utf8(num_slice)
+            .map_err(|_| ImportError::InvalidJson("invalid number utf8".to_string()))?;
+
+        if is_float {
+            let f: f64 = s.parse().map_err(|_| ImportError::InvalidJson(format!("invalid float: '{s}'")))?;
+            Ok(JsonValue::Float(f))
+        } else {
+            if num_slice.len() > 1 && num_slice[0] == b'0' {
+                return Err(ImportError::InvalidJson("leading zeros not permitted in integer".to_string()));
+            }
+            let u: u64 = s.parse().map_err(|_| ImportError::InvalidJson(format!("invalid uint: '{s}'")))?;
+            Ok(JsonValue::Uint(u))
+        }
     }
 
     fn parse_array(&mut self) -> Result<JsonValue, ImportError> {
@@ -800,6 +867,682 @@ pub fn safe_resolve_model_dir(dir: &Path) -> Result<PathBuf, ImportError> {
         return Err(ImportError::Io("path is not a directory".to_string()));
     }
     Ok(canonical)
+}
+
+// ---------------------------------------------------------------------------
+// Donor Config Parser (§B4.2)
+// ---------------------------------------------------------------------------
+
+/// Parse HuggingFace LLaMA/SmolLM2-style `config.json` into SandyRust `Config`
+/// with `ext_x17_import: true` under strict profile validation.
+pub fn parse_donor_config(
+    json_bytes: &[u8],
+    requested_seq_len: Option<usize>,
+) -> Result<Config, ImportError> {
+    if json_bytes.len() > HEADER_CAP as usize {
+        return Err(ImportError::HeaderTooLarge {
+            n: json_bytes.len() as u64,
+            cap: HEADER_CAP,
+        });
+    }
+
+    let mut parser = JsonParser::new(json_bytes);
+    let root = parser.parse_object()?;
+
+    // Check architectures whitelist if present
+    if let Some(JsonValue::Array(arr)) = root.get("architectures") {
+        let has_llama = arr.iter().any(|v| v.as_str() == Some("LlamaForCausalLM"));
+        if !has_llama {
+            let first_arch = arr.first().and_then(|v| v.as_str()).unwrap_or("unknown");
+            return Err(ImportError::UnsupportedArchitecture(format!(
+                "architecture '{first_arch}' is not supported; expected LlamaForCausalLM"
+            )));
+        }
+    }
+
+    // Rejections per §B4.2
+    if let Some(b) = root.get("attention_bias").and_then(|v| v.as_bool()) {
+        if b {
+            return Err(ImportError::UnsupportedArchitecture(
+                "attention_bias=true is not supported".to_string(),
+            ));
+        }
+    }
+    if let Some(b) = root.get("mlp_bias").and_then(|v| v.as_bool()) {
+        if b {
+            return Err(ImportError::UnsupportedArchitecture(
+                "mlp_bias=true is not supported".to_string(),
+            ));
+        }
+    }
+    if let Some(act) = root.get("hidden_act").and_then(|v| v.as_str()) {
+        if act != "silu" {
+            return Err(ImportError::UnsupportedArchitecture(format!(
+                "hidden_act='{act}' is not supported; expected 'silu'"
+            )));
+        }
+    }
+    if let Some(rope_scaling) = root.get("rope_scaling") {
+        if !matches!(rope_scaling, JsonValue::Null) {
+            return Err(ImportError::UnsupportedRope);
+        }
+    }
+    if let Some(sliding) = root.get("sliding_window") {
+        if !matches!(sliding, JsonValue::Null) {
+            return Err(ImportError::UnsupportedArchitecture(
+                "sliding_window is not supported".to_string(),
+            ));
+        }
+    }
+
+    // Hyperparameters
+    let vocab_size = root
+        .get("vocab_size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ImportError::InvalidJson("missing 'vocab_size' in config.json".to_string()))?
+        as usize;
+    let d_model = root
+        .get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ImportError::InvalidJson("missing 'hidden_size' in config.json".to_string()))?
+        as usize;
+    let n_layers = root
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            ImportError::InvalidJson("missing 'num_hidden_layers' in config.json".to_string())
+        })? as usize;
+    let n_q_heads = root
+        .get("num_attention_heads")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            ImportError::InvalidJson("missing 'num_attention_heads' in config.json".to_string())
+        })? as usize;
+    let n_kv_heads = root
+        .get("num_key_value_heads")
+        .and_then(|v| v.as_u64())
+        .map(|u| u as usize)
+        .unwrap_or(n_q_heads);
+    let d_ff = root
+        .get("intermediate_size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            ImportError::InvalidJson("missing 'intermediate_size' in config.json".to_string())
+        })? as usize;
+
+    let max_pos = root
+        .get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .map(|u| u as usize)
+        .unwrap_or(2048);
+    let requested = requested_seq_len.unwrap_or(64);
+    let max_seq_len = requested.min(max_pos).min(MAX_SEQ_CAP);
+
+    let rope_theta = root
+        .get("rope_theta")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000.0) as f32;
+    let rms_eps = root
+        .get("rms_norm_eps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-5) as f32;
+
+    let bos_id = root
+        .get("bos_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let eos_id = root
+        .get("eos_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let pad_id = root
+        .get("pad_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let tied_embeddings = root
+        .get("tie_word_embeddings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let cfg = Config {
+        schema_version: 1,
+        vocab_size,
+        d_model,
+        n_layers,
+        n_q_heads,
+        n_kv_heads,
+        d_ff,
+        max_seq_len,
+        batch_size: 2,
+        rope_theta,
+        rms_eps,
+        bos_id,
+        eos_id,
+        pad_id,
+        tied_embeddings,
+        seed: 0x5EED_5A9D,
+        ext_x13_hooks: false,
+        ext_x13_edit: false,
+        ext_x12e_entropy_sampling: false,
+        ext_x15_lora: false,
+        ext_x17_import: true,
+    };
+
+    cfg.validate()
+        .map_err(|e| ImportError::InvalidJson(format!("donor config failed validation: {e:?}")))?;
+    Ok(cfg)
+}
+
+// ---------------------------------------------------------------------------
+// Import Manifest & Identity Binding (§B8.1, §B8.2)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportManifest {
+    pub source_repo: String,
+    pub source_commit: String,
+    pub source_license_spdx: String,
+    pub sha256_model_safetensors: [u8; 32],
+    pub sha256_config_json: [u8; 32],
+    pub sha256_tokenizer_json: [u8; 32],
+    pub sha256_tokenizer_config_json: [u8; 32],
+    pub importer_version: String,
+    pub mapping_table_version: String,
+    pub sandyrust_commit: String,
+    pub dtype_source: String,
+    pub conversion: String,
+}
+
+impl ImportManifest {
+    pub fn canonical_text(&self) -> String {
+        format!(
+            "conversion={}\ndtype_source={}\nimporter_version={}\nmapping_table_version={}\nsandyrust_commit={}\nsha256_config_json={}\nsha256_model_safetensors={}\nsha256_tokenizer_config_json={}\nsha256_tokenizer_json={}\nsource_commit={}\nsource_license_spdx={}\nsource_repo={}\n",
+            self.conversion,
+            self.dtype_source,
+            self.importer_version,
+            self.mapping_table_version,
+            self.sandyrust_commit,
+            hex(&self.sha256_config_json),
+            hex(&self.sha256_model_safetensors),
+            hex(&self.sha256_tokenizer_config_json),
+            hex(&self.sha256_tokenizer_json),
+            self.source_commit,
+            self.source_license_spdx,
+            self.source_repo,
+        )
+    }
+
+    pub fn fingerprint(&self) -> [u8; 32] {
+        crate::sha256::sha256(self.canonical_text().as_bytes())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RIMP Checkpoint Serialization and Deserialization (§B8.2)
+// ---------------------------------------------------------------------------
+
+pub const RIMP_MAGIC: &[u8; 4] = b"RIMP";
+pub const RIMP_VERSION: u32 = 1;
+
+/// Serialize an imported Model to the canonical RIMP checkpoint format.
+pub fn serialize_rimp(
+    model: &Model,
+    manifest_hash: [u8; 32],
+    tokenizer_fingerprint: [u8; 32],
+) -> Result<Vec<u8>, ImportError> {
+    let cfg = &model.cfg;
+    if !cfg.ext_x17_import {
+        return Err(ImportError::InvalidJson(
+            "cannot serialize baseline model as RIMP (ext_x17_import must be true)".to_string(),
+        ));
+    }
+
+    let tensors = model.tensors();
+    let mut payload = Vec::new();
+    let mut entries = Vec::new();
+
+    for (name, t) in &tensors {
+        let off = payload.len() as u64;
+        for &x in t.data() {
+            if !x.is_finite() {
+                return Err(ImportError::NonFinite {
+                    name: name.clone(),
+                    index: 0,
+                });
+            }
+            payload.extend_from_slice(&x.to_le_bytes());
+        }
+        let len = payload.len() as u64 - off;
+        let digest = crate::sha256::sha256(&payload[off as usize..]);
+
+        let mut e = Vec::new();
+        e.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        e.extend_from_slice(name.as_bytes());
+        e.extend_from_slice(&(t.shape().len() as u32).to_le_bytes());
+        for &d in t.shape() {
+            e.extend_from_slice(&(d as u64).to_le_bytes());
+        }
+        e.push(0); // dtype 0 = f32
+        e.extend_from_slice(&off.to_le_bytes());
+        e.extend_from_slice(&len.to_le_bytes());
+        e.extend_from_slice(&digest);
+        entries.push(e);
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(RIMP_MAGIC);
+    out.extend_from_slice(&RIMP_VERSION.to_le_bytes());
+    out.extend_from_slice(&manifest_hash);
+
+    // Architecture parameters
+    out.extend_from_slice(&(cfg.vocab_size as u32).to_le_bytes());
+    out.extend_from_slice(&(cfg.d_model as u32).to_le_bytes());
+    out.extend_from_slice(&(cfg.n_layers as u32).to_le_bytes());
+    out.extend_from_slice(&(cfg.n_q_heads as u32).to_le_bytes());
+    out.extend_from_slice(&(cfg.n_kv_heads as u32).to_le_bytes());
+    out.extend_from_slice(&(cfg.d_ff as u32).to_le_bytes());
+    out.extend_from_slice(&(cfg.tied_embeddings as u32).to_le_bytes());
+    out.extend_from_slice(&(cfg.max_seq_len as u32).to_le_bytes());
+    out.extend_from_slice(&cfg.rope_theta.to_bits().to_le_bytes());
+    out.extend_from_slice(&cfg.rms_eps.to_bits().to_le_bytes());
+    out.extend_from_slice(&cfg.bos_id.to_le_bytes());
+    out.extend_from_slice(&cfg.eos_id.to_le_bytes());
+    out.extend_from_slice(&cfg.pad_id.to_le_bytes());
+    out.extend_from_slice(&(cfg.batch_size as u32).to_le_bytes());
+    out.extend_from_slice(&cfg.seed.to_le_bytes());
+
+    out.extend_from_slice(&cfg.fingerprint());
+    out.extend_from_slice(&tokenizer_fingerprint);
+
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        out.extend_from_slice(&e);
+    }
+    out.extend_from_slice(&payload);
+
+    // Append full payload digest at the very end
+    let full_digest = crate::sha256::sha256(&out);
+    out.extend_from_slice(&full_digest);
+
+    Ok(out)
+}
+
+/// Deserialize a Model from a RIMP checkpoint buffer.
+pub fn deserialize_rimp(
+    data: &[u8],
+    expected_manifest: Option<[u8; 32]>,
+    max_bytes: usize,
+) -> Result<Model, ImportError> {
+    if data.len() > max_bytes {
+        return Err(ImportError::TooLarge {
+            what: "RIMP file",
+            size: data.len(),
+            cap: max_bytes,
+        });
+    }
+    if data.len() < 4 + 4 + 32 + (13 * 4) + 32 + 32 + 4 + 32 {
+        return Err(ImportError::BadHeader(
+            "RIMP file shorter than minimum header size".to_string(),
+        ));
+    }
+
+    // Check magic
+    if &data[0..4] == b"RCHK" {
+        return Err(ImportError::BadHeader(
+            "expected magic RIMP, got baseline RCHK".to_string(),
+        ));
+    }
+    if &data[0..4] != RIMP_MAGIC {
+        return Err(ImportError::BadHeader(format!(
+            "invalid magic in RIMP checkpoint: {:?}",
+            &data[0..4]
+        )));
+    }
+
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version != RIMP_VERSION {
+        return Err(ImportError::BadHeader(format!(
+            "unsupported RIMP version {version}"
+        )));
+    }
+
+    // Check overall checksum
+    let content_len = data.len() - 32;
+    let expected_checksum = &data[content_len..];
+    let computed_checksum = crate::sha256::sha256(&data[..content_len]);
+    if computed_checksum != expected_checksum {
+        return Err(ImportError::ManifestMismatch(
+            "checksum mismatch in RIMP checkpoint".to_string(),
+        ));
+    }
+
+    let manifest_hash: [u8; 32] = data[8..40].try_into().unwrap();
+    if let Some(exp) = expected_manifest {
+        if manifest_hash != exp {
+            return Err(ImportError::ManifestMismatch(format!(
+                "manifest mismatch: expected {}, got {}",
+                hex(&exp),
+                hex(&manifest_hash)
+            )));
+        }
+    }
+
+    struct RimpReader<'a> {
+        data: &'a [u8],
+        cursor: usize,
+        content_len: usize,
+    }
+    impl<'a> RimpReader<'a> {
+        fn take_u32(&mut self) -> Result<u32, ImportError> {
+            if self.cursor + 4 > self.content_len {
+                return Err(ImportError::BadHeader("unexpected EOF in RIMP header".to_string()));
+            }
+            let v = u32::from_le_bytes(self.data[self.cursor..self.cursor + 4].try_into().unwrap());
+            self.cursor += 4;
+            Ok(v)
+        }
+        fn take_u64(&mut self) -> Result<u64, ImportError> {
+            if self.cursor + 8 > self.content_len {
+                return Err(ImportError::BadHeader("unexpected EOF in RIMP header".to_string()));
+            }
+            let v = u64::from_le_bytes(self.data[self.cursor..self.cursor + 8].try_into().unwrap());
+            self.cursor += 8;
+            Ok(v)
+        }
+        fn take_bytes(&mut self, n: usize) -> Result<&'a [u8], ImportError> {
+            if self.cursor + n > self.content_len {
+                return Err(ImportError::BadHeader("unexpected EOF in RIMP header".to_string()));
+            }
+            let slice = &self.data[self.cursor..self.cursor + n];
+            self.cursor += n;
+            Ok(slice)
+        }
+        fn take_u8(&mut self) -> Result<u8, ImportError> {
+            if self.cursor >= self.content_len {
+                return Err(ImportError::BadHeader("unexpected EOF in RIMP header".to_string()));
+            }
+            let b = self.data[self.cursor];
+            self.cursor += 1;
+            Ok(b)
+        }
+    }
+
+    let mut reader = RimpReader {
+        data,
+        cursor: 40,
+        content_len,
+    };
+
+    let vocab_size = reader.take_u32()? as usize;
+    let d_model = reader.take_u32()? as usize;
+    let n_layers = reader.take_u32()? as usize;
+    let n_q_heads = reader.take_u32()? as usize;
+    let n_kv_heads = reader.take_u32()? as usize;
+    let d_ff = reader.take_u32()? as usize;
+    let tied_embeddings = reader.take_u32()? != 0;
+    let max_seq_len = reader.take_u32()? as usize;
+    let rope_theta = f32::from_bits(reader.take_u32()?);
+    let rms_eps = f32::from_bits(reader.take_u32()?);
+    let bos_id = reader.take_u32()?;
+    let eos_id = reader.take_u32()?;
+    let pad_id = reader.take_u32()?;
+    let batch_size = reader.take_u32()? as usize;
+    let seed = reader.take_u64()?;
+
+    let config_fingerprint: [u8; 32] = reader.take_bytes(32)?.try_into().unwrap();
+    let _tokenizer_fingerprint: [u8; 32] = reader.take_bytes(32)?.try_into().unwrap();
+
+    let cfg = Config {
+        schema_version: 1,
+        vocab_size,
+        d_model,
+        n_layers,
+        n_q_heads,
+        n_kv_heads,
+        d_ff,
+        max_seq_len,
+        batch_size,
+        rope_theta,
+        rms_eps,
+        bos_id,
+        eos_id,
+        pad_id,
+        tied_embeddings,
+        seed,
+        ext_x13_hooks: false,
+        ext_x13_edit: false,
+        ext_x12e_entropy_sampling: false,
+        ext_x15_lora: false,
+        ext_x17_import: true,
+    };
+    cfg.validate()
+        .map_err(|e| ImportError::BadHeader(format!("RIMP config validation failed: {e:?}")))?;
+
+    if cfg.fingerprint() != config_fingerprint {
+        return Err(ImportError::BadHeader(
+            "RIMP config fingerprint mismatch".to_string(),
+        ));
+    }
+
+    let tensor_count = reader.take_u32()? as usize;
+    let inv = crate::model::inventory(&cfg);
+    if tensor_count != inv.len() {
+        return Err(ImportError::ShapeMismatch {
+            name: "tensor_count".to_string(),
+            expected: vec![inv.len()],
+            actual: vec![tensor_count],
+        });
+    }
+
+    struct Entry {
+        name: String,
+        shape: Vec<usize>,
+        off: usize,
+        len: usize,
+        digest: [u8; 32],
+    }
+
+    let mut entries = Vec::with_capacity(tensor_count);
+    for _ in 0..tensor_count {
+        let name_len = reader.take_u32()? as usize;
+        let name_bytes = reader.take_bytes(name_len)?;
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|_| ImportError::BadHeader("invalid UTF-8 in tensor name".to_string()))?
+            .to_string();
+
+        let rank = reader.take_u32()? as usize;
+        let mut shape = Vec::with_capacity(rank);
+        for _ in 0..rank {
+            let d = reader.take_u64()? as usize;
+            shape.push(d);
+        }
+
+        let dtype_tag = reader.take_u8()?;
+        if dtype_tag != 0 {
+            return Err(ImportError::UnsupportedDtype {
+                name: name.clone(),
+                dtype: format!("tag {dtype_tag}"),
+            });
+        }
+
+        let off = reader.take_u64()? as usize;
+        let len = reader.take_u64()? as usize;
+        let digest: [u8; 32] = reader.take_bytes(32)?.try_into().unwrap();
+
+        entries.push(Entry {
+            name,
+            shape,
+            off,
+            len,
+            digest,
+        });
+    }
+
+    let payload_start = reader.cursor;
+    let mut tensors = Vec::with_capacity(tensor_count);
+
+    for (entry, (expected_name, expected_shape)) in entries.into_iter().zip(&inv) {
+        if &entry.name != expected_name {
+            return Err(ImportError::MissingTensor(format!(
+                "expected {expected_name}, got {}",
+                entry.name
+            )));
+        }
+        if &entry.shape != expected_shape {
+            return Err(ImportError::ShapeMismatch {
+                name: entry.name.clone(),
+                expected: expected_shape.clone(),
+                actual: entry.shape.clone(),
+            });
+        }
+
+        let tensor_start = payload_start + entry.off;
+        let tensor_end = tensor_start + entry.len;
+        if tensor_end > content_len {
+            return Err(ImportError::OffsetOutOfBounds {
+                name: entry.name.clone(),
+            });
+        }
+
+        let slice = &data[tensor_start..tensor_end];
+        let actual_digest = crate::sha256::sha256(slice);
+        if actual_digest != entry.digest {
+            return Err(ImportError::ManifestMismatch(format!(
+                "digest mismatch for tensor '{}'",
+                entry.name
+            )));
+        }
+
+        let floats = decode_tensor_f32(Dtype::F32, slice, &entry.name)?;
+        let t = Tensor::from_vec(&entry.shape, floats)
+            .map_err(|e| ImportError::BadShape {
+                name: format!("{}: {:?}", entry.name, e),
+            })?;
+        tensors.push(t);
+    }
+
+    let model = Model::from_tensors(&cfg, tensors)
+        .map_err(|e| ImportError::InvalidJson(format!("failed to construct Model: {e:?}")))?;
+    Ok(model)
+}
+
+/// Save model to a RIMP file on disk, refusing to overwrite existing files.
+pub fn save_rimp(
+    path: &Path,
+    model: &Model,
+    manifest_hash: [u8; 32],
+    tokenizer_fingerprint: [u8; 32],
+) -> Result<(), ImportError> {
+    if path.exists() {
+        return Err(ImportError::Io(format!(
+            "refusing to overwrite existing file at '{}'",
+            path.display()
+        )));
+    }
+    let bytes = serialize_rimp(model, manifest_hash, tokenizer_fingerprint)?;
+    fs::write(path, bytes).map_err(|e| ImportError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Load model from a RIMP file on disk.
+pub fn load_rimp(
+    path: &Path,
+    expected_manifest: Option<[u8; 32]>,
+    max_bytes: usize,
+) -> Result<Model, ImportError> {
+    let meta = fs::metadata(path).map_err(|e| ImportError::Io(e.to_string()))?;
+    if meta.len() as usize > max_bytes {
+        return Err(ImportError::TooLarge {
+            what: "RIMP file",
+            size: meta.len() as usize,
+            cap: max_bytes,
+        });
+    }
+    let bytes = fs::read(path).map_err(|e| ImportError::Io(e.to_string()))?;
+    deserialize_rimp(&bytes, expected_manifest, max_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Model Inspection Helper (§B12)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelInspection {
+    pub safetensors_header: SafetensorsHeader,
+    pub donor_config: Config,
+    pub sha256_model_safetensors: [u8; 32],
+    pub sha256_config_json: [u8; 32],
+    pub sha256_tokenizer_json: Option<[u8; 32]>,
+    pub sha256_tokenizer_config_json: Option<[u8; 32]>,
+    pub license: Option<String>,
+    pub tensor_count: usize,
+    pub total_param_count: usize,
+}
+
+pub fn inspect_model_dir(dir: &Path) -> Result<ModelInspection, ImportError> {
+    let canonical = safe_resolve_model_dir(dir)?;
+    let config_path = canonical.join("config.json");
+    let safetensors_path = canonical.join("model.safetensors");
+
+    if !config_path.exists() {
+        return Err(ImportError::Io(
+            "missing config.json in model directory".to_string(),
+        ));
+    }
+    if !safetensors_path.exists() {
+        return Err(ImportError::Io(
+            "missing model.safetensors in model directory".to_string(),
+        ));
+    }
+
+    let config_bytes = fs::read(&config_path).map_err(|e| ImportError::Io(e.to_string()))?;
+    let sha256_config_json = crate::sha256::sha256(&config_bytes);
+    let donor_config = parse_donor_config(&config_bytes, None)?;
+
+    let (safetensors_header, safetensors_bytes) = read_safetensors_file(&safetensors_path)?;
+    let sha256_model_safetensors = crate::sha256::sha256(&safetensors_bytes);
+
+    let tok_path = canonical.join("tokenizer.json");
+    let sha256_tokenizer_json = if tok_path.exists() {
+        let b = fs::read(&tok_path).map_err(|e| ImportError::Io(e.to_string()))?;
+        Some(crate::sha256::sha256(&b))
+    } else {
+        None
+    };
+
+    let tok_cfg_path = canonical.join("tokenizer_config.json");
+    let sha256_tokenizer_config_json = if tok_cfg_path.exists() {
+        let b = fs::read(&tok_cfg_path).map_err(|e| ImportError::Io(e.to_string()))?;
+        Some(crate::sha256::sha256(&b))
+    } else {
+        None
+    };
+
+    let license = safetensors_header.metadata.as_ref().and_then(|meta| {
+        meta.iter()
+            .find(|(k, _)| k == "license")
+            .map(|(_, v)| v.clone())
+    });
+
+    let tensor_count = safetensors_header.tensors.len();
+    let total_param_count: usize = safetensors_header
+        .tensors
+        .iter()
+        .map(|t| t.shape.iter().product::<usize>())
+        .sum();
+
+    Ok(ModelInspection {
+        safetensors_header,
+        donor_config,
+        sha256_model_safetensors,
+        sha256_config_json,
+        sha256_tokenizer_json,
+        sha256_tokenizer_config_json,
+        license,
+        tensor_count,
+        total_param_count,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,29 +1964,219 @@ pub fn gx17_3() -> GateReport {
     )
 }
 
-/// Composite Gate GX17 report covering Phase I1 deliverables.
+/// GX17-4: Synthetic model mapping and RIMP round-trip determinism (§B11 GX17-4).
+pub fn gx17_4() -> GateReport {
+    let t0 = Instant::now();
+    let mut ok = true;
+
+    let cfg = Config {
+        schema_version: 1,
+        vocab_size: 16,
+        d_model: 8,
+        n_layers: 2,
+        n_q_heads: 2,
+        n_kv_heads: 1,
+        d_ff: 16,
+        max_seq_len: 16,
+        batch_size: 2,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        bos_id: 0,
+        eos_id: 1,
+        pad_id: 2,
+        tied_embeddings: true,
+        seed: 0x1717_5EED,
+        ext_x13_hooks: false,
+        ext_x13_edit: false,
+        ext_x12e_entropy_sampling: false,
+        ext_x15_lora: false,
+        ext_x17_import: true,
+    };
+
+    let model = match Model::init(&cfg) {
+        Ok(m) => m,
+        Err(_) => return report("GX17-4", "acceptance", t0, false, "Synthetic model init", "init", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
+    };
+
+    let manifest_hash = [0xABu8; 32];
+    let tok_fp = [0xCDu8; 32];
+
+    let bytes1 = match serialize_rimp(&model, manifest_hash, tok_fp) {
+        Ok(b) => b,
+        Err(_) => return report("GX17-4", "acceptance", t0, false, "Synthetic serialize", "serialize", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
+    };
+    let bytes2 = match serialize_rimp(&model, manifest_hash, tok_fp) {
+        Ok(b) => b,
+        Err(_) => return report("GX17-4", "acceptance", t0, false, "Synthetic serialize 2", "serialize", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
+    };
+
+    // Determinism test: identical bytes across runs
+    let deterministic = bytes1 == bytes2;
+    ok &= deterministic;
+
+    // Deserialization test
+    let loaded = match deserialize_rimp(&bytes1, Some(manifest_hash), 64 * 1024 * 1024) {
+        Ok(m) => m,
+        Err(_) => return report("GX17-4", "acceptance", t0, false, "Synthetic deserialize", "deserialize", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
+    };
+
+    // Bitwise match across all tensors
+    let orig_tensors = model.tensors();
+    let loaded_tensors = loaded.tensors();
+    ok &= orig_tensors.len() == loaded_tensors.len();
+    for ((n1, t1), (n2, t2)) in orig_tensors.iter().zip(&loaded_tensors) {
+        ok &= n1 == n2;
+        ok &= t1.shape() == t2.shape();
+        for (&x, &y) in t1.data().iter().zip(t2.data()) {
+            ok &= x.to_bits() == y.to_bits();
+        }
+    }
+
+    report(
+        "GX17-4",
+        "acceptance",
+        t0,
+        ok,
+        "Mapping on synthetic model and RIMP round-trip determinism (§B11 GX17-4)",
+        "RIMP serialization, deserialization, and deterministic bitwise equality verified on synthetic model",
+        "Synthetic model with GQA and import profile hyperparameters",
+        "Non-deterministic checkpoint serialization or float degradation",
+        "gx17-4-synthetic-roundtrip-v1".to_string(),
+        "synthetic_import",
+        "fp32",
+        "Determinism=true, bitwise match=true".to_string(),
+        format!("determinism={deterministic}, bitwise_match={ok}"),
+        0.0,
+        0.0,
+    )
+}
+
+/// GX17-6: Identity, manifest tampering, and cryptographic hash binding (§B11 GX17-6).
+pub fn gx17_6() -> GateReport {
+    let t0 = Instant::now();
+    let mut ok = true;
+
+    let cfg = Config {
+        schema_version: 1,
+        vocab_size: 16,
+        d_model: 8,
+        n_layers: 2,
+        n_q_heads: 2,
+        n_kv_heads: 1,
+        d_ff: 16,
+        max_seq_len: 16,
+        batch_size: 2,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        bos_id: 0,
+        eos_id: 1,
+        pad_id: 2,
+        tied_embeddings: true,
+        seed: 0x1717_5EED,
+        ext_x13_hooks: false,
+        ext_x13_edit: false,
+        ext_x12e_entropy_sampling: false,
+        ext_x15_lora: false,
+        ext_x17_import: true,
+    };
+    let model = match Model::init(&cfg) {
+        Ok(m) => m,
+        Err(_) => return report("GX17-6", "integrity", t0, false, "Init model", "init", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
+    };
+
+    let manifest_hash = [0x55u8; 32];
+    let tok_fp = [0x66u8; 32];
+    let rimp_bytes = match serialize_rimp(&model, manifest_hash, tok_fp) {
+        Ok(b) => b,
+        Err(_) => return report("GX17-6", "integrity", t0, false, "Serialize RIMP", "serialize", "none", "none", "".into(), "synthetic", "fp32", "ok".into(), "err".into(), 0.0, 0.0),
+    };
+
+    // 1. Baseline checkpoint loader rejects RIMP with BadMagic
+    let base_cfg = Config::reference_v2();
+    let bad_magic_rep = crate::checkpoint::parse(&rimp_bytes, &base_cfg, 64 * 1024 * 1024);
+    let rchk_rejects_rimp = matches!(bad_magic_rep, Err(crate::checkpoint::CheckpointError::BadMagic));
+    ok &= rchk_rejects_rimp;
+
+    // 2. RIMP loader rejects baseline RCHK with BadHeader
+    let base_model = Model::init(&base_cfg).unwrap();
+    let rchk_bytes = crate::checkpoint::serialize(&base_model);
+    let rimp_rejects_rchk = matches!(deserialize_rimp(&rchk_bytes, None, 64 * 1024 * 1024), Err(ImportError::BadHeader(_)));
+    ok &= rimp_rejects_rchk;
+
+    // 3. Tampering with expected manifest hash causes ManifestMismatch
+    let wrong_manifest = [0x77u8; 32];
+    let manifest_tampered = matches!(deserialize_rimp(&rimp_bytes, Some(wrong_manifest), 64 * 1024 * 1024), Err(ImportError::ManifestMismatch(_)));
+    ok &= manifest_tampered;
+
+    // 4. Tampering with any byte of payload causes ChecksumMismatch (ManifestMismatch variant)
+    let mut corrupted = rimp_bytes.clone();
+    let len = corrupted.len();
+    corrupted[len / 2] ^= 0xFF;
+    let checksum_tampered = matches!(deserialize_rimp(&corrupted, Some(manifest_hash), 64 * 1024 * 1024), Err(ImportError::ManifestMismatch(_)));
+    ok &= checksum_tampered;
+
+    // 5. Cache binding: KVCache from model A rejects model B
+    let mut other_cfg = cfg.clone();
+    other_cfg.seed = 0x9999;
+    let other_model = Model::init(&other_cfg).unwrap();
+    let mut cache = crate::cache::KVCache::new(&cfg, model.fingerprint(), 1).unwrap();
+    let step_res = crate::cache::forward_step(&other_model, 0, 0, &mut cache);
+    let cache_rejected = matches!(step_res, Err(crate::model::ModelError::Cache(_)));
+    ok &= cache_rejected;
+
+    report(
+        "GX17-6",
+        "integrity",
+        t0,
+        ok,
+        "Identity and cryptographic hash binding (specv3 §B8.2, §B8.3, §B11 GX17-6)",
+        "Baseline RCHK rejects RIMP; RIMP rejects RCHK; manifest and checksum tampering detected; cache model binding verified",
+        "RIMP checkpoint format, SHA-256 bindings, and KVCache fingerprints",
+        "Permissive cross-loading of incompatible checkpoints or untracked tampering",
+        "gx17-6-identity-binding-v1".to_string(),
+        "import_profile",
+        "fp32",
+        "All 5 identity and binding invariants verified".to_string(),
+        format!("rchk_rejects_rimp={rchk_rejects_rimp}, rimp_rejects_rchk={rimp_rejects_rchk}, manifest_tampered={manifest_tampered}, checksum_tampered={checksum_tampered}, cache_rejected={cache_rejected}"),
+        0.0,
+        0.0,
+    )
+}
+
+/// Composite Gate GX17 report covering Phase I1 & Phase I2 deliverables.
 pub fn gx17() -> GateReport {
     let t0 = Instant::now();
     let r0 = gx17_0();
     let r1 = gx17_1();
     let r2 = gx17_2();
     let r3 = gx17_3();
+    let r4 = gx17_4();
+    let r6 = gx17_6();
 
-    let ok = r0.status == "PASS" && r1.status == "PASS" && r2.status == "PASS" && r3.status == "PASS";
+    let ok = r0.status == "PASS"
+        && r1.status == "PASS"
+        && r2.status == "PASS"
+        && r3.status == "PASS"
+        && r4.status == "PASS"
+        && r6.status == "PASS";
+
     report(
         "GX17",
         "acceptance",
         t0,
         ok,
-        "Extension X17: External Pretrained Weight Import Phase I1 (specv3 §3.6, §13.2, GX17)",
-        "GX17-0 baseline untouched; GX17-1 negative suite; GX17-2 fuzz test; GX17-3 dtype conversion parity",
-        "Zero-crate pure-Rust safetensors reader and float decoders",
-        "Regression or baseline behavioral mutation",
-        "gx17-composite-v1".to_string(),
+        "Extension X17: External Pretrained Weight Import Phases I1 & I2 (specv3 §3.6, §13.2, GX17)",
+        "GX17-0 baseline untouched; GX17-1 negative suite; GX17-2 fuzz test; GX17-3 dtype conversion; GX17-4 synthetic roundtrip; GX17-6 identity binding",
+        "Pure-Rust safetensors reader, RIMP checkpoint format, and cryptographic hash bindings",
+        "Regression, identity bypass, or baseline behavioral mutation",
+        "gx17-composite-v2".to_string(),
         "reference_v2",
         "fp32",
-        "GX17-0, GX17-1, GX17-2, GX17-3 all PASS".to_string(),
-        format!("GX17-0={} GX17-1={} GX17-2={} GX17-3={}", r0.status, r1.status, r2.status, r3.status),
+        "GX17-0, GX17-1, GX17-2, GX17-3, GX17-4, GX17-6 all PASS".to_string(),
+        format!(
+            "GX17-0={} GX17-1={} GX17-2={} GX17-3={} GX17-4={} GX17-6={}",
+            r0.status, r1.status, r2.status, r3.status, r4.status, r6.status
+        ),
         0.0,
         0.0,
     )

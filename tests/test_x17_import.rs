@@ -53,9 +53,25 @@ fn test_gx17_composite_gate() {
 }
 
 #[test]
+fn test_gx17_4_synthetic_roundtrip() {
+    let rep = sandy_rust::import::gx17_4();
+    assert_eq!(rep.status, "PASS");
+    assert_eq!(rep.gate_id, "GX17-4");
+    assert_eq!(rep.scope, "acceptance");
+}
+
+#[test]
+fn test_gx17_6_identity_and_binding() {
+    let rep = sandy_rust::import::gx17_6();
+    assert_eq!(rep.status, "PASS");
+    assert_eq!(rep.gate_id, "GX17-6");
+    assert_eq!(rep.scope, "integrity");
+}
+
+#[test]
 fn test_gx17_runner_dispatch() {
-    let reps = gates::run(&["gx17", "gx17_0", "gx17_1", "gx17_2", "gx17_3"]).unwrap();
-    assert_eq!(reps.len(), 5);
+    let reps = gates::run(&["gx17", "gx17_0", "gx17_1", "gx17_2", "gx17_3", "gx17_4", "gx17_6"]).unwrap();
+    assert_eq!(reps.len(), 7);
     for r in reps {
         assert_eq!(r.status, "PASS", "Gate {} failed", r.gate_id);
     }
@@ -134,3 +150,114 @@ fn test_config_import_profile_rules() {
     base_cfg.n_kv_heads = 2;
     assert!(matches!(base_cfg.validate(), Err(ConfigError::ExtensionNotEnabled(_))));
 }
+
+#[test]
+fn test_parse_donor_config_smollm2_json() {
+    let json_str = r#"{
+        "architectures": ["LlamaForCausalLM"],
+        "hidden_size": 576,
+        "intermediate_size": 1536,
+        "num_hidden_layers": 30,
+        "num_attention_heads": 9,
+        "num_key_value_heads": 3,
+        "vocab_size": 49152,
+        "max_position_embeddings": 8192,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 100000.0,
+        "bos_token_id": 0,
+        "eos_token_id": 0,
+        "pad_token_id": 0,
+        "tie_word_embeddings": true
+    }"#;
+
+    let cfg = sandy_rust::import::parse_donor_config(json_str.as_bytes(), Some(2048)).unwrap();
+    assert_eq!(cfg.d_model, 576);
+    assert_eq!(cfg.d_ff, 1536);
+    assert_eq!(cfg.n_layers, 30);
+    assert_eq!(cfg.n_q_heads, 9);
+    assert_eq!(cfg.n_kv_heads, 3);
+    assert_eq!(cfg.vocab_size, 49152);
+    assert_eq!(cfg.max_seq_len, 2048);
+    assert_eq!(cfg.rope_theta, 100000.0);
+    assert_eq!(cfg.rms_eps, 1e-5);
+    assert!(cfg.tied_embeddings);
+    assert!(cfg.ext_x17_import);
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn test_import_manifest_format_and_hash() {
+    let manifest = sandy_rust::import::ImportManifest {
+        source_repo: "HuggingFaceTB/SmolLM2-135M".to_string(),
+        source_commit: "277ec9b".to_string(),
+        source_license_spdx: "Apache-2.0".to_string(),
+        sha256_model_safetensors: [0x11u8; 32],
+        sha256_config_json: [0x22u8; 32],
+        sha256_tokenizer_json: [0x33u8; 32],
+        sha256_tokenizer_config_json: [0x44u8; 32],
+        importer_version: "sandy_rust-0.1.0-x17".to_string(),
+        mapping_table_version: "llama_dense_v1".to_string(),
+        sandyrust_commit: "unknown".to_string(),
+        dtype_source: "bf16".to_string(),
+        conversion: "lossless_widen".to_string(),
+    };
+
+    let text = manifest.canonical_text();
+    assert!(text.contains("source_repo=HuggingFaceTB/SmolLM2-135M\n"));
+    assert!(text.contains("conversion=lossless_widen\n"));
+    // Canonical text must end with LF
+    assert!(text.ends_with('\n'));
+    // Fingerprint should be deterministic
+    let h1 = manifest.fingerprint();
+    let h2 = manifest.fingerprint();
+    assert_eq!(h1, h2);
+}
+
+#[test]
+fn test_rimp_serialize_deserialize_roundtrip() {
+    use sandy_rust::model::Model;
+
+    let cfg = Config {
+        schema_version: 1,
+        vocab_size: 16,
+        d_model: 8,
+        n_layers: 1,
+        n_q_heads: 2,
+        n_kv_heads: 1,
+        d_ff: 16,
+        max_seq_len: 16,
+        batch_size: 2,
+        rope_theta: 10000.0,
+        rms_eps: 1e-5,
+        bos_id: 0,
+        eos_id: 1,
+        pad_id: 2,
+        tied_embeddings: false, // test untied lm_head as well
+        seed: 42,
+        ext_x13_hooks: false,
+        ext_x13_edit: false,
+        ext_x12e_entropy_sampling: false,
+        ext_x15_lora: false,
+        ext_x17_import: true,
+    };
+
+    let model = Model::init(&cfg).unwrap();
+    assert!(model.lm_head.is_some());
+
+    let manifest_hash = [0xAAu8; 32];
+    let tok_fp = [0xBBu8; 32];
+
+    let bytes = sandy_rust::import::serialize_rimp(&model, manifest_hash, tok_fp).unwrap();
+    assert_eq!(&bytes[..4], b"RIMP");
+
+    let loaded = sandy_rust::import::deserialize_rimp(&bytes, Some(manifest_hash), 16 * 1024 * 1024).unwrap();
+    assert_eq!(loaded.cfg, cfg);
+    assert_eq!(loaded.fingerprint(), model.fingerprint());
+
+    // Forward output parity between original and loaded
+    let tokens = [0u32, 5, 10];
+    let out_orig = model.forward(&tokens, None).unwrap();
+    let out_loaded = loaded.forward(&tokens, None).unwrap();
+    assert_eq!(out_orig.data(), out_loaded.data());
+}
+

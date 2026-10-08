@@ -498,7 +498,11 @@ pub fn forward_step_with_hooks(
         }
     }
 
-    let mut logits = matmul(&final_x, &model.embed.transpose2d()?)?;
+    let head_mat = match &model.lm_head {
+        Some(h) => h,
+        None => &model.embed,
+    };
+    let mut logits = matmul(&final_x, &head_mat.transpose2d()?)?;
 
     // Site 12b: Logits
     if let Some(hook_ctx) = ctx {
