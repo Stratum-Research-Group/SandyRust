@@ -4,9 +4,15 @@
 use crate::tensor::ops::masked_softmax_row;
 use crate::tensor::{Tensor, TensorError};
 
+pub mod flash;
 pub mod gqa;
 pub mod qknorm;
 pub mod rope_ext;
+pub use flash::{
+    flash_attention, flash_attention_backward, flash_attention_multihead_backward,
+    flash_attention_multihead_forward, gx8, AttentionError, AttentionMetadata,
+    validate_attention_metadata, validate_x8_attention_metadata,
+};
 pub use gqa::{attention_gqa, gx1, repeat_kv_heads};
 pub use qknorm::{apply_qk_norm_head, gx3};
 pub use rope_ext::{
