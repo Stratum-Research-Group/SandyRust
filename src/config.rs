@@ -42,6 +42,7 @@ pub struct Config {
     pub ext_x13_edit: bool,
     pub ext_x12e_entropy_sampling: bool,
     pub ext_x15_lora: bool,
+    pub ext_x17_import: bool,
 }
 
 pub const MAX_SEQ_CAP: usize = 8192;
@@ -50,6 +51,10 @@ pub const MAX_LAYERS_CAP: usize = 32;
 pub const MAX_D_MODEL_CAP: usize = 2048;
 pub const MAX_VOCAB_CAP: usize = 65536;
 pub const MAX_PARAM_BYTES_CAP: usize = 128 * 1024 * 1024; // 128 MiB
+
+pub const MAX_IMPORT_VOCAB_CAP: usize = 262_144;
+pub const MAX_IMPORT_PARAM_BYTES_CAP: usize = 1024 * 1024 * 1024; // 1 GiB
+pub const MAX_IMPORT_SINGLE_TENSOR_BYTES_CAP: usize = 512 * 1024 * 1024; // 512 MiB
 
 impl Config {
     /// `reference_v2` baseline: MHA, tied, V=259, D=128, L=4, P=886,272.
@@ -75,6 +80,7 @@ impl Config {
             ext_x13_edit: false,
             ext_x12e_entropy_sampling: false,
             ext_x15_lora: false,
+            ext_x17_import: false,
         }
     }
 
@@ -84,7 +90,7 @@ impl Config {
 
     /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
     pub fn fingerprint(&self) -> [u8; 32] {
-        let s = if !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora {
+        let s = if !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
             format!(
                 "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
@@ -94,12 +100,12 @@ impl Config {
             )
         } else {
             format!(
-                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x13h{}:x13e{}:x12e{}:x15l{}",
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
                 self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
                 self.batch_size, self.rope_theta.to_bits(), self.rms_eps.to_bits(),
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed,
-                self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora
+                self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
             )
         };
         crate::sha256::sha256(s.as_bytes())
@@ -137,19 +143,36 @@ impl Config {
         if self.head_dim() == 0 || self.head_dim() % 2 != 0 {
             return Err(ConfigError::Divisibility("head_dim must be even"));
         }
-        if self.vocab_size < 259 {
+        let max_vocab = if self.ext_x17_import {
+            MAX_IMPORT_VOCAB_CAP
+        } else {
+            MAX_VOCAB_CAP
+        };
+        if self.vocab_size > max_vocab {
+            return Err(ConfigError::ResourceCap("vocab_size"));
+        }
+        if !self.ext_x17_import && self.vocab_size < 259 {
             return Err(ConfigError::OutOfRange("vocab_size < 259"));
+        }
+        if self.ext_x17_import && self.vocab_size == 0 {
+            return Err(ConfigError::OutOfRange("vocab_size == 0"));
         }
         if self.max_seq_len < 1 {
             return Err(ConfigError::OutOfRange("max_seq_len"));
         }
         let v = self.vocab_size as u64;
         let ids = [self.bos_id, self.eos_id, self.pad_id];
-        if ids.iter().any(|&i| i < 256 || u64::from(i) >= v) {
-            return Err(ConfigError::SpecialTokens("special id must be in 256..vocab_size"));
-        }
-        if ids[0] == ids[1] || ids[1] == ids[2] || ids[0] == ids[2] {
-            return Err(ConfigError::SpecialTokens("special ids must be pairwise distinct"));
+        if self.ext_x17_import {
+            if ids.iter().any(|&i| u64::from(i) >= v) {
+                return Err(ConfigError::SpecialTokens("special id must be < vocab_size"));
+            }
+        } else {
+            if ids.iter().any(|&i| i < 256 || u64::from(i) >= v) {
+                return Err(ConfigError::SpecialTokens("special id must be in 256..vocab_size"));
+            }
+            if ids[0] == ids[1] || ids[1] == ids[2] || ids[0] == ids[2] {
+                return Err(ConfigError::SpecialTokens("special ids must be pairwise distinct"));
+            }
         }
         if self.max_seq_len > MAX_SEQ_CAP {
             return Err(ConfigError::ResourceCap("max_seq_len"));
@@ -163,21 +186,25 @@ impl Config {
         if self.d_model > MAX_D_MODEL_CAP {
             return Err(ConfigError::ResourceCap("d_model"));
         }
-        if self.vocab_size > MAX_VOCAB_CAP {
-            return Err(ConfigError::ResourceCap("vocab_size"));
-        }
         let p_count = self.param_count().ok_or(ConfigError::ResourceCap("param_count overflow"))?;
         let param_bytes = p_count.checked_mul(4).ok_or(ConfigError::ResourceCap("param_bytes overflow"))?;
-        if param_bytes > MAX_PARAM_BYTES_CAP {
+        let max_param_bytes = if self.ext_x17_import {
+            MAX_IMPORT_PARAM_BYTES_CAP
+        } else {
+            MAX_PARAM_BYTES_CAP
+        };
+        if param_bytes > max_param_bytes {
             return Err(ConfigError::ResourceCap("total param bytes exceeds MAX_PARAM_BYTES_CAP"));
         }
 
         // Strict baseline extension rejection: baseline must be tied MHA
-        if !self.tied_embeddings {
-            return Err(ConfigError::ExtensionNotEnabled("tied_embeddings=false is extension X2, disabled in baseline"));
-        }
-        if self.n_kv_heads != self.n_q_heads {
-            return Err(ConfigError::ExtensionNotEnabled("n_kv_heads != n_q_heads is extension X1 (GQA/MQA), disabled in baseline"));
+        if !self.ext_x17_import {
+            if !self.tied_embeddings {
+                return Err(ConfigError::ExtensionNotEnabled("tied_embeddings=false is extension X2, disabled in baseline"));
+            }
+            if self.n_kv_heads != self.n_q_heads {
+                return Err(ConfigError::ExtensionNotEnabled("n_kv_heads != n_q_heads is extension X1 (GQA/MQA), disabled in baseline"));
+            }
         }
 
         Ok(())
