@@ -262,6 +262,9 @@ pub fn loss_and_grad<T: Float>(
             return Err(TrainError::InvalidArgument("params/grads tensor shape mismatch"));
         }
     }
+    if cfg.ext_x7_chunked_loss {
+        return crate::loss::chunked_loss_and_grad(cfg, p, window, denom, grads);
+    }
     let n = window.len() - 1;
     let (tokens, targets) = (&window[..n], &window[1..]);
     let (d, vs, dh, hq, hkv, dff) = (cfg.d_model, cfg.vocab_size, cfg.head_dim(), cfg.n_q_heads, cfg.n_kv_heads, cfg.d_ff);
@@ -548,6 +551,9 @@ pub fn forward_loss<T: Float>(
         if p.data[ti].len() != expected_len {
             return Err(TrainError::InvalidArgument("params tensor shape mismatch"));
         }
+    }
+    if cfg.ext_x7_chunked_loss {
+        return crate::loss::chunked_forward_loss(cfg, p, window);
     }
     let n = window.len() - 1;
     let (tokens, targets) = (&window[..n], &window[1..]);

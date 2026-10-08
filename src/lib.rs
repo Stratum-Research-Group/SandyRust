@@ -14,6 +14,7 @@ pub mod gemm;
 pub mod generation;
 pub mod hooks;
 pub mod import;
+pub mod loss;
 pub mod model;
 pub mod optimizer;
 pub mod rng;

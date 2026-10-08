@@ -288,6 +288,8 @@ fn test_rimp_serialize_deserialize_roundtrip() {
         ext_x5_gemm: false,
         ext_x6_arena: false,
         max_arena_bytes: 512 * 1024 * 1024,
+        ext_x7_chunked_loss: false,
+        chunk_size: 16,
         ext_x13_hooks: false,
         ext_x13_edit: false,
         ext_x12e_entropy_sampling: false,
