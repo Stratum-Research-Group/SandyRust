@@ -8,8 +8,8 @@
   "implemented_check": "param_inventory, zero_input_stability, analytic_gradients, entropy_stability, checkpoint_isolation, incremental_decode_parity",
   "prerequisites": "reference_v2, G4, G5, G6, G10",
   "exclusions": "none",
-  "revision": "fedff2b",
-  "dirty_state": true,
+  "revision": "a7fc266",
+  "dirty_state": false,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo test --test test_x3_qknorm",
@@ -22,5 +22,5 @@
   "observed": "param_inventory: mha=887296(+1024), gqa=821504(+768), mqa=788608(+640) (ok=true); zero_input_stability: norm_zero=true, vjp_zero=true (ok=true); analytic_gradients: max_err_x=2.71e-9, max_err_g=7.60e-10 (ok=true); entropy_stability: unnorm_collapsed=true (ent1=2.00, ent50=2.46e-7); qknorm_stable=true (ent1=1.46, ent50=1.46) (ok=true); checkpoint_isolation: reload_exact=true, cross_reject=true (ok=true); incremental_decode_parity: max_err=0.00e0 (ok=true)",
   "tolerance_atol": 0.00001,
   "tolerance_rtol": 0.0001,
-  "execution_time_ms": 80
+  "execution_time_ms": 88
 }
