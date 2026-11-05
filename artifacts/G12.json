@@ -8,7 +8,7 @@
   "implemented_check": "Greedy ignores PRNG; seeded sampling repeats; terminal_logits match full forward terminal row; Utf8ByteStreamBuffer handles splits",
   "prerequisites": "Generation engine, Utf8ByteStreamBuffer",
   "exclusions": "Lossy whole-buffer only decoding",
-  "revision": "369e023",
+  "revision": "368480d",
   "dirty_state": false,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",

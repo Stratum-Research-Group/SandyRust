@@ -8,7 +8,7 @@
   "implemented_check": "Oversize checkpoint rejected; context capacity exceeded rejected; rank mismatch rejected; all-PAD rejected; config cap rejected",
   "prerequisites": "Resource accounting and validation",
   "exclusions": "Unbounded buffer growth",
-  "revision": "369e023",
+  "revision": "368480d",
   "dirty_state": false,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",

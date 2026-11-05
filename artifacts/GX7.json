@@ -8,7 +8,7 @@
   "implemented_check": "exact_loss_and_grad_equivalence, tail_chunk_handling, padding_mask_and_zero_valid, zero_retained_chunk_logits, activation_recomputation_immutability",
   "prerequisites": "reference_v2, G3, G8",
   "exclusions": "none",
-  "revision": "369e023",
+  "revision": "368480d",
   "dirty_state": false,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
@@ -22,5 +22,5 @@
   "observed": "exact_loss_and_grad_equivalence: loss_diff=0.00e0, max_grad_diff=0.00e0 (ok=true); tail_chunk_handling: diff=0.00e0 (ok=true); padding_mask_and_zero_valid (ok=true); zero_retained_chunk_logits: ratio=2.06x reduction (ok=true); activation_recomputation_immutability (ok=true)",
   "tolerance_atol": 0.000001,
   "tolerance_rtol": 0.00001,
-  "execution_time_ms": 157
+  "execution_time_ms": 169
 }
