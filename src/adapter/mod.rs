@@ -1,4 +1,4 @@
-#![allow(clippy::needless_range_loop, clippy::manual_slice_fill)]
+#![allow(clippy::needless_range_loop)]
 
 //! FP32 Low-Rank Adaptation (LoRA) module (§A5, Gate GX15).
 //!

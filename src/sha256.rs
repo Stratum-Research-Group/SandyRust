@@ -60,7 +60,12 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 pub fn hex(d: &[u8]) -> String {
-    d.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    let mut s = String::with_capacity(d.len() * 2);
+    for b in d {
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
 }
 
 #[cfg(test)]

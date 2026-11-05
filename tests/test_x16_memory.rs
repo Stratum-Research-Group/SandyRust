@@ -1,4 +1,4 @@
-#![allow(clippy::needless_range_loop, clippy::manual_slice_fill)]
+#![allow(clippy::needless_range_loop)]
 
 //! Test suite for Gate GX16: Associative Fast-Weight Memory (§A6).
 

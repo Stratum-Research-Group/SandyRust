@@ -7,7 +7,7 @@
 //! - Read-before-update: r_t = M_{n-1} q_t (no future leakage)
 //! - Zero-gate initialization (g = 0.0) guarantees exact baseline equivalence at step 0.
 
-#![allow(clippy::needless_range_loop, clippy::manual_slice_fill)]
+#![allow(clippy::needless_range_loop)]
 
 use crate::config::Config;
 use crate::rng::Rng;

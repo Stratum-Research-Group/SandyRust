@@ -9,14 +9,14 @@ use std::path::PathBuf;
 
 fn create_deterministic_docs() -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
     let train_docs = vec![
-        (b"Document one with structured token bytes for training.".to_vec()).into_iter().map(|b| b as u32).collect(),
-        (b"Second document containing diverse byte sequences.".to_vec()).into_iter().map(|b| b as u32).collect(),
-        (b"Third document providing additional coverage for windows.".to_vec()).into_iter().map(|b| b as u32).collect(),
-        (b"Fourth document completing the minimal training split.".to_vec()).into_iter().map(|b| b as u32).collect(),
+        b"Document one with structured token bytes for training.".iter().map(|&b| b as u32).collect(),
+        b"Second document containing diverse byte sequences.".iter().map(|&b| b as u32).collect(),
+        b"Third document providing additional coverage for windows.".iter().map(|&b| b as u32).collect(),
+        b"Fourth document completing the minimal training split.".iter().map(|&b| b as u32).collect(),
     ];
     let val_docs = vec![
-        (b"Held-out validation document alpha for evaluation.".to_vec()).into_iter().map(|b| b as u32).collect(),
-        (b"Held-out validation document beta testing generalisation.".to_vec()).into_iter().map(|b| b as u32).collect(),
+        b"Held-out validation document alpha for evaluation.".iter().map(|&b| b as u32).collect(),
+        b"Held-out validation document beta testing generalisation.".iter().map(|&b| b as u32).collect(),
     ];
     (train_docs, val_docs)
 }

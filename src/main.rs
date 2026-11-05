@@ -90,20 +90,20 @@ fn load_or_generate_corpus(
     } else {
         // Deterministic multi-document synthetic corpus
         let train_docs = vec![
-            (b"Hello world from SandyRust transformer!".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"Pure Rust autoregressive language model baseline.".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"The quick brown fox jumps over the lazy dog.".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"Crouzeix ratio constant verification in FP64.".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"Zero third-party crate dependencies in R1 std.".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"Rotary positional embeddings preserve isometric norms.".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"Attention masking isolates padded future query tokens.".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"Deterministic state resumption reproduces all moments.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            b"Hello world from SandyRust transformer!".iter().map(|&b| b as u32).collect(),
+            b"Pure Rust autoregressive language model baseline.".iter().map(|&b| b as u32).collect(),
+            b"The quick brown fox jumps over the lazy dog.".iter().map(|&b| b as u32).collect(),
+            b"Crouzeix ratio constant verification in FP64.".iter().map(|&b| b as u32).collect(),
+            b"Zero third-party crate dependencies in R1 std.".iter().map(|&b| b as u32).collect(),
+            b"Rotary positional embeddings preserve isometric norms.".iter().map(|&b| b as u32).collect(),
+            b"Attention masking isolates padded future query tokens.".iter().map(|&b| b as u32).collect(),
+            b"Deterministic state resumption reproduces all moments.".iter().map(|&b| b as u32).collect(),
         ];
         let val_docs = vec![
-            (b"Held-out validation set document number one.".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"Testing generalisation on unseen evaluation tokens.".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"Bounded cross-entropy loss reduction over epochs.".to_vec()).into_iter().map(|b| b as u32).collect(),
-            (b"Evaluating forward loss on separate loader cursor.".to_vec()).into_iter().map(|b| b as u32).collect(),
+            b"Held-out validation set document number one.".iter().map(|&b| b as u32).collect(),
+            b"Testing generalisation on unseen evaluation tokens.".iter().map(|&b| b as u32).collect(),
+            b"Bounded cross-entropy loss reduction over epochs.".iter().map(|&b| b as u32).collect(),
+            b"Evaluating forward loss on separate loader cursor.".iter().map(|&b| b as u32).collect(),
         ];
         Ok((train_docs, val_docs))
     }

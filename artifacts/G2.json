@@ -8,8 +8,8 @@
   "implemented_check": "Analytic fixtures for 2x3*3x2 matmul, 2x2x2 batched matmul, and logsumexp LN_2 match",
   "prerequisites": "CPU contiguous tensors",
   "exclusions": "GPU GEMM",
-  "revision": "a7fc266",
-  "dirty_state": false,
+  "revision": "9293e4c",
+  "dirty_state": true,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo run --release -- verify",
@@ -22,5 +22,5 @@
   "observed": "matmul=true batched=true lse=true",
   "tolerance_atol": 0.00001,
   "tolerance_rtol": 0.0001,
-  "execution_time_ms": 11
+  "execution_time_ms": 12
 }

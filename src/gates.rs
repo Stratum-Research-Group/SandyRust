@@ -168,7 +168,7 @@ pub fn g1() -> GateReport {
     let deps = manifest.split("[dependencies]").nth(1).unwrap_or("");
     let deps = deps.split("\n[").next().unwrap_or("");
     let n = deps.lines().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).count();
-    let hash = sha256(manifest.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hash = crate::sha256::hex(&sha256(manifest.as_bytes()));
     let build_rs_absent = !std::path::Path::new("build.rs").exists();
     report(
         "G1",

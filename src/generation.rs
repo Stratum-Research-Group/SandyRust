@@ -75,7 +75,7 @@ impl AdaptiveSamplerConfig {
                         field: "min_p_base".to_string(),
                     });
                 }
-                if !min_p_cap.is_finite() || min_p_cap < 0.0 || min_p_cap >= 1.0 {
+                if !min_p_cap.is_finite() || !(0.0..1.0).contains(&min_p_cap) {
                     return Err(GenerationError::InvalidAdaptiveConfig {
                         field: "min_p_cap".to_string(),
                     });
