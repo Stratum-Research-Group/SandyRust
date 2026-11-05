@@ -257,3 +257,107 @@ fn test_x15_gqa_target_dims_and_merge() {
     let merged_out = merged.forward(&tokens, None).unwrap();
     assert_eq!(base_out, merged_out, "Zero-init GQA LoRA merge must bitwise match base model");
 }
+
+#[test]
+fn test_x15_end_to_end_token_adaptation_decreases_loss() {
+    let cfg = Config::reference_v2();
+    let base_model = Model::init(&cfg).unwrap();
+    let base_fp_before = base_model.fingerprint();
+
+    // Sequence to adapt via LoRA
+    let tokens = vec![256u32, 65, 66, 67, 68, 69, 70, 71, 72];
+    let n_denom = (tokens.len() - 1) as f32;
+
+    let base_params = sandy_rust::autodiff::Params::<f32>::from_model(&base_model);
+    let mut initial_grads = sandy_rust::autodiff::Params::<f32>::zeros_like(&base_params);
+    let initial_loss_out = sandy_rust::autodiff::loss_and_grad(&cfg, &base_params, &tokens, n_denom, &mut initial_grads).unwrap();
+    let initial_loss = initial_loss_out.loss_sum / initial_loss_out.n_valid as f32;
+
+    let targets = [
+        AdapterTarget::Wq,
+        AdapterTarget::Wk,
+        AdapterTarget::Wv,
+        AdapterTarget::Wo,
+        AdapterTarget::Wgate,
+        AdapterTarget::Wup,
+        AdapterTarget::Wdown,
+    ];
+    let mut adapter = LoraAdapter::new(&cfg, 4, 8.0, &targets, 1234, base_fp_before, [0u8; 32]).unwrap();
+
+    let lr = 0.05f32;
+    for _step in 0..15 {
+        let merged_model = adapter.merge(&base_model).unwrap();
+        let current_params = sandy_rust::autodiff::Params::<f32>::from_model(&merged_model);
+        let mut grads = sandy_rust::autodiff::Params::<f32>::zeros_like(&current_params);
+        let _ = sandy_rust::autodiff::loss_and_grad(&cfg, &current_params, &tokens, n_denom, &mut grads).unwrap();
+
+        // Accumulate gradient onto adapter
+        for (l_idx, layer_adapter) in adapter.layers.iter_mut().enumerate() {
+            let p_idx = sandy_rust::autodiff::layer_indices(&cfg, l_idx);
+            for (&target, mat) in layer_adapter.iter_mut() {
+                let grad_idx = match target {
+                    AdapterTarget::Wq => p_idx.wq,
+                    AdapterTarget::Wk => p_idx.wk,
+                    AdapterTarget::Wv => p_idx.wv,
+                    AdapterTarget::Wo => p_idx.wo,
+                    AdapterTarget::Wgate => p_idx.w_gate,
+                    AdapterTarget::Wup => p_idx.w_up,
+                    AdapterTarget::Wdown => p_idx.w_down,
+                };
+                let dw = &grads.data[grad_idx];
+                let s = mat.scale();
+                let d_in = mat.d_in;
+                let d_out = mat.d_out;
+                let r = mat.r;
+
+                // dB[i, k] = s * sum_j (dW[j * d_out + i] * A[k * d_in + j])
+                let mut db = vec![0.0f32; d_out * r];
+                for i in 0..d_out {
+                    for k in 0..r {
+                        let mut sum = 0.0f32;
+                        for j in 0..d_in {
+                            sum += dw[j * d_out + i] * mat.a[k * d_in + j];
+                        }
+                        db[i * r + k] = s * sum;
+                    }
+                }
+
+                // dA[k, j] = s * sum_i (dW[j * d_out + i] * B[i * r + k])
+                let mut da = vec![0.0f32; r * d_in];
+                for k in 0..r {
+                    for j in 0..d_in {
+                        let mut sum = 0.0f32;
+                        for i in 0..d_out {
+                            sum += dw[j * d_out + i] * mat.b[i * r + k];
+                        }
+                        da[k * d_in + j] = s * sum;
+                    }
+                }
+
+                for (v, &g) in mat.b.iter_mut().zip(&db) {
+                    *v -= lr * g;
+                }
+                for (v, &g) in mat.a.iter_mut().zip(&da) {
+                    *v -= lr * g;
+                }
+            }
+        }
+    }
+
+    let final_merged = adapter.merge(&base_model).unwrap();
+    let final_params = sandy_rust::autodiff::Params::<f32>::from_model(&final_merged);
+    let mut final_grads = sandy_rust::autodiff::Params::<f32>::zeros_like(&final_params);
+    let final_loss_out = sandy_rust::autodiff::loss_and_grad(&cfg, &final_params, &tokens, n_denom, &mut final_grads).unwrap();
+    let final_loss = final_loss_out.loss_sum / final_loss_out.n_valid as f32;
+
+    assert!(
+        final_loss < initial_loss,
+        "LoRA adaptation must strictly decrease loss: initial {initial_loss} vs final {final_loss}"
+    );
+    assert_eq!(
+        base_model.fingerprint(),
+        base_fp_before,
+        "Base model must remain strictly frozen and unmodified throughout LoRA adaptation"
+    );
+}
+
