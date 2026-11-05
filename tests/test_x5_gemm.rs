@@ -220,3 +220,29 @@ fn test_x5_gate_gx5_execution() {
     assert_eq!(dispatched.len(), 1);
     assert_eq!(dispatched[0].status, "PASS");
 }
+
+#[test]
+fn test_x5_model_forward_and_cache_parity() {
+    let cfg_base = Config::reference_v2();
+    let cfg_gemm = Config::gemm_opt_v2();
+    let model_base = sandy_rust::model::Model::init(&cfg_base).unwrap();
+    let model_gemm = sandy_rust::model::Model::init(&cfg_gemm).unwrap();
+
+    let tokens = vec![1, 10, 42, 100];
+    let out_base = model_base.forward(&tokens, None).unwrap();
+    let out_gemm = model_gemm.forward(&tokens, None).unwrap();
+
+    let (ok, diff) = check_parity(out_gemm.data(), out_base.data(), 1e-4, 1e-3);
+    assert!(ok, "Model forward with ext_x5_gemm parity failed: max diff = {diff}");
+
+    let mut cache = sandy_rust::cache::KVCache::new(&model_gemm.cfg, model_gemm.fingerprint(), 1).unwrap();
+    let mut last_logits = None;
+    for (pos, &tok) in tokens.iter().enumerate() {
+        let l = sandy_rust::cache::forward_step(&model_gemm, tok, pos, &mut cache).unwrap();
+        last_logits = Some(l);
+    }
+    let last_step = last_logits.unwrap();
+    let final_row = &out_gemm.data()[3 * cfg_gemm.vocab_size..4 * cfg_gemm.vocab_size];
+    let (ok_cache, diff_cache) = check_parity(last_step.data(), final_row, 1e-4, 1e-3);
+    assert!(ok_cache, "KV-cache step parity with ext_x5_gemm failed: max diff = {diff_cache}");
+}

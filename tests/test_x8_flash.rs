@@ -383,3 +383,24 @@ fn test_x8_gate_gx8_execution() {
     assert_eq!(report.gate_id, "GX8");
     assert_eq!(report.status, "PASS", "Gate GX8 failed: {:?}", report.observed);
 }
+
+#[test]
+fn test_x8_model_forward_parity() {
+    let cfg_base = Config::reference_v2();
+    let cfg_flash = Config::flash_attn_v2();
+    let model_base = sandy_rust::model::Model::init(&cfg_base).unwrap();
+    let model_flash = sandy_rust::model::Model::init(&cfg_flash).unwrap();
+
+    let tokens = vec![1, 10, 42, 100];
+    let out_base = model_base.forward(&tokens, None).unwrap();
+    let out_flash = model_flash.forward(&tokens, None).unwrap();
+
+    assert_eq!(out_base.shape(), out_flash.shape());
+    for (i, (&a, &b)) in out_base.data().iter().zip(out_flash.data().iter()).enumerate() {
+        let diff = (a - b).abs();
+        assert!(
+            diff < 1e-4,
+            "mismatch between reference attention and FlashAttention-2 at index {i}: {a} vs {b}"
+        );
+    }
+}

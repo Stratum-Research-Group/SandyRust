@@ -248,6 +248,21 @@ pub fn forward_step_with_hooks(
         1.0
     };
 
+    let mm = |a: &Tensor, b: &Tensor| -> Result<Tensor, TensorError> {
+        if c.ext_x5_gemm {
+            crate::gemm::gemm(a, b)
+        } else {
+            matmul(a, b)
+        }
+    };
+    let mm_tb = |a: &Tensor, b: &Tensor| -> Result<Tensor, TensorError> {
+        if c.ext_x5_gemm {
+            crate::gemm::gemm_trans_b(a, b)
+        } else {
+            matmul_trans_b(a, b)
+        }
+    };
+
     for (l_idx, l) in model.layers.iter().enumerate() {
         let layer_u16 = l_idx as u16;
 
@@ -281,9 +296,9 @@ pub fn forward_step_with_hooks(
             }
         }
 
-        let q = matmul(&r, &l.wq)?;
-        let k = matmul(&r, &l.wk)?;
-        let v = matmul(&r, &l.wv)?;
+        let q = mm(&r, &l.wq)?;
+        let k = mm(&r, &l.wk)?;
+        let v = mm(&r, &l.wv)?;
 
         // Apply RoPE at current absolute position pos
         let mut k_rope = Tensor::zeros(&[1, kv_dim])?;
@@ -419,7 +434,7 @@ pub fn forward_step_with_hooks(
             merged.data_mut()[h * dh..(h + 1) * dh].copy_from_slice(o.data());
         }
 
-        let mut attn_out = matmul(&merged, &l.wo)?;
+        let mut attn_out = mm(&merged, &l.wo)?;
 
         // Site 8: AttnOut
         if let Some(hook_ctx) = ctx {
@@ -467,7 +482,7 @@ pub fn forward_step_with_hooks(
             }
         }
 
-        let mut hidden = mul(&silu(&matmul(&r2, &l.w_gate)?), &matmul(&r2, &l.w_up)?)?;
+        let mut hidden = mul(&silu(&mm(&r2, &l.w_gate)?), &mm(&r2, &l.w_up)?)?;
 
         // Site 10b: MlpHidden
         if let Some(hook_ctx) = ctx {
@@ -483,7 +498,7 @@ pub fn forward_step_with_hooks(
             }
         }
 
-        let mut mlp_out = matmul(&hidden, &l.w_down)?;
+        let mut mlp_out = mm(&hidden, &l.w_down)?;
 
         // Site 10c: MlpOut
         if let Some(hook_ctx) = ctx {
@@ -536,7 +551,7 @@ pub fn forward_step_with_hooks(
         Some(h) => h,
         None => &model.embed,
     };
-    let mut logits = matmul_trans_b(&final_x, head_mat)?;
+    let mut logits = mm_tb(&final_x, head_mat)?;
 
     // Site 12b: Logits
     if let Some(hook_ctx) = ctx {

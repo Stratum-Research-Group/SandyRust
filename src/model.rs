@@ -275,6 +275,21 @@ impl Model {
         }
 
         let (dh, group) = (c.head_dim(), c.n_q_heads / c.n_kv_heads);
+        let mm = |a: &Tensor, b: &Tensor| -> Result<Tensor, TensorError> {
+            if c.ext_x5_gemm {
+                crate::gemm::gemm(a, b)
+            } else {
+                matmul(a, b)
+            }
+        };
+        let mm_tb = |a: &Tensor, b: &Tensor| -> Result<Tensor, TensorError> {
+            if c.ext_x5_gemm {
+                crate::gemm::gemm_trans_b(a, b)
+            } else {
+                matmul_trans_b(a, b)
+            }
+        };
+
         for (l_idx, l) in self.layers.iter().enumerate() {
             let layer_u16 = l_idx as u16;
 
@@ -308,7 +323,7 @@ impl Model {
                 }
             }
 
-            let (q, k, v) = (matmul(&r, &l.wq)?, matmul(&r, &l.wk)?, matmul(&r, &l.wv)?);
+            let (q, k, v) = (mm(&r, &l.wq)?, mm(&r, &l.wk)?, mm(&r, &l.wv)?);
             let rope_freqs = if c.ext_x4_rope {
                 Some(crate::attention::rope_ext::compute_frequencies(dh, c.rope_theta as f64, c.rope_scaling.as_ref()))
             } else {
@@ -399,7 +414,19 @@ impl Model {
                     }
                 }
 
-                let (mut o, probs) = crate::attention::attention_ref_scaled(&qh, &kh, &vh, valid, valid, 0, attn_scale)?;
+                let (mut o, probs) = if c.ext_x8_flash_attn && (!c.ext_x4_rope || c.rope_scaling.is_none()) {
+                    let (flash_o, _lse) = crate::attention::flash::flash_attention(
+                        &qh, &kh, &vh, valid, valid, 0, None, c.flash_br, c.flash_bc,
+                    )?;
+                    let p = if ctx.is_some() {
+                        crate::attention::attention_ref_scaled(&qh, &kh, &vh, valid, valid, 0, attn_scale)?.1
+                    } else {
+                        Vec::new()
+                    };
+                    (flash_o, p)
+                } else {
+                    crate::attention::attention_ref_scaled(&qh, &kh, &vh, valid, valid, 0, attn_scale)?
+                };
 
                 // Site 6: AttnPattern
                 if let Some(hook_ctx) = ctx {
@@ -430,7 +457,7 @@ impl Model {
                 }
             }
 
-            let mut attn_out = matmul(&merged, &l.wo)?;
+            let mut attn_out = mm(&merged, &l.wo)?;
 
             // Site 8: AttnOut
             if let Some(hook_ctx) = ctx {
@@ -478,7 +505,7 @@ impl Model {
                 }
             }
 
-            let mut hidden = mul(&silu(&matmul(&r2, &l.w_gate)?), &matmul(&r2, &l.w_up)?)?;
+            let mut hidden = mul(&silu(&mm(&r2, &l.w_gate)?), &mm(&r2, &l.w_up)?)?;
 
             // Site 10b: MlpHidden (post-SwiGLU)
             if let Some(hook_ctx) = ctx {
@@ -494,7 +521,7 @@ impl Model {
                 }
             }
 
-            let mut mlp_out = matmul(&hidden, &l.w_down)?;
+            let mut mlp_out = mm(&hidden, &l.w_down)?;
 
             // Site 10c: MlpOut
             if let Some(hook_ctx) = ctx {
@@ -547,7 +574,7 @@ impl Model {
             Some(h) => h,
             None => &self.embed,
         };
-        let mut logits = matmul_trans_b(&final_x, head_mat)?;
+        let mut logits = mm_tb(&final_x, head_mat)?;
 
         // Site 12b: Logits
         if let Some(hook_ctx) = ctx {
