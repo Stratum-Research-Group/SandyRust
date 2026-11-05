@@ -92,6 +92,13 @@ pub struct Config {
     pub ext_x13_edit: bool,
     pub ext_x12e_entropy_sampling: bool,
     pub ext_x15_lora: bool,
+    pub ext_x16_memory: bool,
+    pub x16_d_mem: usize,
+    pub x16_chunk_size: usize,
+    pub x16_eta: f32,
+    pub x16_theta: f32,
+    pub x16_alpha_forget: f32,
+    pub x16_bptt_chunks: usize,
     pub ext_x17_import: bool,
 }
 
@@ -143,6 +150,13 @@ impl Config {
             ext_x13_edit: false,
             ext_x12e_entropy_sampling: false,
             ext_x15_lora: false,
+            ext_x16_memory: false,
+            x16_d_mem: 64,
+            x16_chunk_size: 8,
+            x16_eta: 0.9,
+            x16_theta: 0.1,
+            x16_alpha_forget: 0.05,
+            x16_bptt_chunks: 1,
             ext_x17_import: false,
         }
     }
@@ -250,7 +264,7 @@ impl Config {
 
     /// Canonical cryptographic fingerprint of forward-affecting hyperparameters.
     pub fn fingerprint(&self) -> [u8; 32] {
-        let s = if !self.ext_x1_gqa && !self.ext_x2_untied_embeddings && !self.ext_x3_qk_norm && !self.ext_x4_rope && !self.ext_x5_gemm && !self.ext_x6_arena && !self.ext_x7_chunked_loss && !self.ext_x8_flash_attn && !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x17_import {
+        let s = if !self.ext_x1_gqa && !self.ext_x2_untied_embeddings && !self.ext_x3_qk_norm && !self.ext_x4_rope && !self.ext_x5_gemm && !self.ext_x6_arena && !self.ext_x7_chunked_loss && !self.ext_x8_flash_attn && !self.ext_x13_hooks && !self.ext_x13_edit && !self.ext_x12e_entropy_sampling && !self.ext_x15_lora && !self.ext_x16_memory && !self.ext_x17_import {
             format!(
                 "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
@@ -264,12 +278,12 @@ impl Config {
                 Some(rs) => format!("{:?}:{}:{}:{:.2}:{:.2}", rs.scaling_type, rs.train_context, rs.target_context, rs.yarn_alpha, rs.yarn_beta),
             };
             format!(
-                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x1g{}:x2u{}:x3q{}:x4r{}:{}:x5g{}:x6a{}:{}:x7c{}:{}:x8f{}:{}:{}:x13h{}:x13e{}:x12e{}:x15l{}:x17i{}",
+                "config:v{}:vs{}:d{}:l{}:q{}:kv{}:ff{}:seq{}:b{}:th_bits{:08x}:eps_bits{:08x}:bos{}:eos{}:pad{}:tied{}:seed{}:x1g{}:x2u{}:x3q{}:x4r{}:{}:x5g{}:x6a{}:{}:x7c{}:{}:x8f{}:{}:{}:x13h{}:x13e{}:x12e{}:x15l{}:x16m{}:x17i{}",
                 self.schema_version, self.vocab_size, self.d_model, self.n_layers,
                 self.n_q_heads, self.n_kv_heads, self.d_ff, self.max_seq_len,
                 self.batch_size, self.rope_theta.to_bits(), self.rms_eps.to_bits(),
                 self.bos_id, self.eos_id, self.pad_id, self.tied_embeddings, self.seed,
-                self.ext_x1_gqa, self.ext_x2_untied_embeddings, self.ext_x3_qk_norm, self.ext_x4_rope, rs_str, self.ext_x5_gemm, self.ext_x6_arena, self.max_arena_bytes, self.ext_x7_chunked_loss, self.chunk_size, self.ext_x8_flash_attn, self.flash_br, self.flash_bc, self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x17_import
+                self.ext_x1_gqa, self.ext_x2_untied_embeddings, self.ext_x3_qk_norm, self.ext_x4_rope, rs_str, self.ext_x5_gemm, self.ext_x6_arena, self.max_arena_bytes, self.ext_x7_chunked_loss, self.chunk_size, self.ext_x8_flash_attn, self.flash_br, self.flash_bc, self.ext_x13_hooks, self.ext_x13_edit, self.ext_x12e_entropy_sampling, self.ext_x15_lora, self.ext_x16_memory, self.ext_x17_import
             )
         };
         crate::sha256::sha256(s.as_bytes())
@@ -396,6 +410,26 @@ impl Config {
 
         if self.ext_x8_flash_attn && (self.flash_br == 0 || self.flash_bc == 0) {
             return Err(ConfigError::OutOfRange("flash_br and flash_bc must be > 0"));
+        }
+        if self.ext_x16_memory {
+            if self.x16_d_mem == 0 || self.x16_d_mem > MAX_D_MODEL_CAP {
+                return Err(ConfigError::OutOfRange("x16_d_mem"));
+            }
+            if self.x16_chunk_size == 0 || self.x16_chunk_size > self.max_seq_len {
+                return Err(ConfigError::OutOfRange("x16_chunk_size"));
+            }
+            if !(self.x16_eta.is_finite() && (0.0..1.0).contains(&self.x16_eta)) {
+                return Err(ConfigError::NonFinite("x16_eta"));
+            }
+            if !(self.x16_theta.is_finite() && self.x16_theta > 0.0) {
+                return Err(ConfigError::NonFinite("x16_theta"));
+            }
+            if !(self.x16_alpha_forget.is_finite() && (0.0..1.0).contains(&self.x16_alpha_forget)) {
+                return Err(ConfigError::NonFinite("x16_alpha_forget"));
+            }
+            if self.x16_bptt_chunks == 0 {
+                return Err(ConfigError::OutOfRange("x16_bptt_chunks"));
+            }
         }
 
         Ok(())

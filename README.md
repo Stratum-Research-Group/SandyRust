@@ -123,6 +123,7 @@ cargo run --release -- import-parity --import models/smollm2_135m.rimp --fixture
 | **GX13** | `acceptance` | **Activation Hooks & Steering** | Zero-overhead Off mode; bitwise record/patch parity; bounded steering | **PASS** |
 | **GX14** | `acceptance` | **Paired Perturbation & Flip-Rate** | 4 synthetic task generators; 0% split leakage; exact hand-worked metrics; reproducible bootstrap | **PASS** |
 | **GX15** | `acceptance` | **FP32 LoRA (Parameter-Efficient)** | Zero-init bitwise match; analytic gradcheck; base immutability; weight merge equivalence | **PASS** |
+| **GX16** | `acceptance` | **Associative Fast-Weight Memory** | Zero-gate baseline match; read-before-update causality; chunk parity; session isolation | **PASS** |
 | **GX17** | `acceptance` | **External Weight Import** | Safetensors reader, RIMP format, dtype conversion, RoPE permutation, BPE tokenizer, memory caps, generation smoke | **PASS** |
 
 ## Unsupported Features & Non-Goals

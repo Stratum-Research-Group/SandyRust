@@ -297,6 +297,13 @@ fn test_rimp_serialize_deserialize_roundtrip() {
         ext_x13_edit: false,
         ext_x12e_entropy_sampling: false,
         ext_x15_lora: false,
+        ext_x16_memory: false,
+        x16_d_mem: 64,
+        x16_chunk_size: 8,
+        x16_eta: 0.9,
+        x16_theta: 0.1,
+        x16_alpha_forget: 0.05,
+        x16_bptt_chunks: 1,
         ext_x17_import: true,
     };
 

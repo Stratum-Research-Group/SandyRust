@@ -114,7 +114,7 @@ fn main() -> ExitCode {
     let cfg = Config::reference_v2();
     match args.first().map(String::as_str) {
         Some("verify") => {
-            let default_gates = "g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14,gx1,gx2,gx3,gx4,gx5,gx6,gx7,gx8,gx12e,gx13,gx14,gx15,gx17";
+            let default_gates = "g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14,gx1,gx2,gx3,gx4,gx5,gx6,gx7,gx8,gx12e,gx13,gx14,gx15,gx16,gx17";
             let gates_flag = match flag(&args, "--gates") {
                 Ok(v) => v,
                 Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
