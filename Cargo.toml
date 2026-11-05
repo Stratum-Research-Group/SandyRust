@@ -9,5 +9,16 @@ license = "MIT OR Apache-2.0"
 # D2-R1: zero third-party dependencies in Phase 1 (no build.rs, no C/C++/CUDA).
 [dependencies]
 
+[[bench]]
+name = "bench_primitives"
+harness = false
+
 [profile.release]
 opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true

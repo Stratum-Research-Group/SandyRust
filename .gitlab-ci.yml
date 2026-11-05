@@ -1,0 +1,26 @@
+stages:
+  - lint
+  - test
+  - verify
+
+default:
+  image: rust:1.82-slim
+  before_script:
+    - rustc --version
+    - cargo --version
+
+lint:
+  stage: lint
+  script:
+    - cargo clippy --all-targets --offline --locked -- -D warnings
+
+test:
+  stage: test
+  script:
+    - cargo test --offline --locked
+
+verify:
+  stage: verify
+  script:
+    - cargo run --release -- verify
+
