@@ -76,3 +76,4 @@ fn test_atomic_rollback_on_pool_exhaustion() {
     assert_eq!(read_k, k);
     assert_eq!(read_v, v);
 }
+
