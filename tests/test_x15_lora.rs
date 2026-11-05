@@ -232,3 +232,28 @@ fn test_x15_gates_runner_integration() {
     assert_eq!(reports[0].gate_id, "GX15");
     assert_eq!(reports[0].status, "PASS");
 }
+
+#[test]
+fn test_x15_gqa_target_dims_and_merge() {
+    let cfg = Config::gqa_v2();
+    assert_eq!(cfg.n_q_heads, 4);
+    assert_eq!(cfg.n_kv_heads, 2);
+    let dh = cfg.head_dim();
+    let q_dim = cfg.n_q_heads * dh;
+    let kv_dim = cfg.n_kv_heads * dh;
+
+    assert_eq!(AdapterTarget::Wq.dims(&cfg), (q_dim, cfg.d_model));
+    assert_eq!(AdapterTarget::Wk.dims(&cfg), (kv_dim, cfg.d_model));
+    assert_eq!(AdapterTarget::Wv.dims(&cfg), (kv_dim, cfg.d_model));
+    assert_eq!(AdapterTarget::Wo.dims(&cfg), (cfg.d_model, q_dim));
+
+    let model = Model::init(&cfg).unwrap();
+    let targets = [AdapterTarget::Wq, AdapterTarget::Wk, AdapterTarget::Wv, AdapterTarget::Wo];
+    let adapter = LoraAdapter::new(&cfg, 4, 8.0, &targets, 42, model.fingerprint(), [0u8; 32]).unwrap();
+    let merged = adapter.merge(&model).unwrap();
+
+    let tokens = [256u32, 65, 66, 67];
+    let base_out = model.forward(&tokens, None).unwrap();
+    let merged_out = merged.forward(&tokens, None).unwrap();
+    assert_eq!(base_out, merged_out, "Zero-init GQA LoRA merge must bitwise match base model");
+}

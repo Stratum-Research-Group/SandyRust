@@ -288,3 +288,31 @@ fn test_x3_gate_gx3_execution() {
     assert_eq!(dispatched.len(), 1);
     assert_eq!(dispatched[0].status, "PASS");
 }
+
+#[test]
+fn test_x3_autodiff_loss_and_grad() {
+    let mut cfg = Config::qk_norm_v2();
+    cfg.chunk_size = 2;
+    let model = Model::init(&cfg).unwrap();
+    let p = sandy_rust::autodiff::Params::<f32>::from_model(&model);
+    let mut grads_mono = p.zeros_like();
+    let mut grads_chunk = p.zeros_like();
+    let window = vec![12u32, 45, 99, 3, 18];
+
+    let out_mono = sandy_rust::autodiff::loss_and_grad(&cfg, &p, &window, 1.0, &mut grads_mono)
+        .expect("monolithic loss_and_grad with QK-Norm");
+    let out_chunk = sandy_rust::loss::chunked_loss_and_grad(&cfg, &p, &window, 1.0, &mut grads_chunk)
+        .expect("chunked loss_and_grad with QK-Norm");
+
+    let fwd_loss = sandy_rust::loss::chunked_forward_loss(&cfg, &p, &window)
+        .expect("chunked forward loss with QK-Norm");
+
+    assert!((out_mono.loss_sum - out_chunk.loss_sum).abs() < 1e-5);
+    assert!((out_chunk.loss_sum - fwd_loss.loss_sum).abs() < 1e-5);
+
+    for (m, c) in grads_mono.data.iter().zip(&grads_chunk.data) {
+        for (&a, &b) in m.iter().zip(c) {
+            assert!((a - b).abs() < 1e-4, "grad mismatch: mono={a}, chunk={b}");
+        }
+    }
+}

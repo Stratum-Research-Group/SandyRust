@@ -6,7 +6,9 @@
 
 use std::time::Instant;
 
-use crate::autodiff::{Float, LossOut, Params, TrainError};
+use crate::autodiff::{
+    final_norm_idx, layer_indices, lm_head_idx, Float, LossOut, Params, TrainError,
+};
 use crate::config::Config;
 use crate::gates::{detect_revision, detect_toolchain, GateReport};
 use crate::model::Model;
@@ -71,6 +73,10 @@ pub fn chunked_loss_and_grad<T: Float>(
         x0: Vec<T>,
         r1: Vec<T>,
         inv1: Vec<T>,
+        q_unnorm: Option<Vec<T>>,
+        inv_q: Option<Vec<T>>,
+        k_unnorm: Option<Vec<T>>,
+        inv_k: Option<Vec<T>>,
         qr: Vec<T>,
         kr: Vec<T>,
         v: Vec<T>,
@@ -86,26 +92,64 @@ pub fn chunked_loss_and_grad<T: Float>(
 
     let mut caches: Vec<LayerCache<T>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
-        let b = 1 + 9 * l;
-        let (g1, wq, wk, wv, wo, g2, wg, wu, wd_) = (
-            &p.data[b],
-            &p.data[b + 1],
-            &p.data[b + 2],
-            &p.data[b + 3],
-            &p.data[b + 4],
-            &p.data[b + 5],
-            &p.data[b + 6],
-            &p.data[b + 7],
-            &p.data[b + 8],
-        );
+        let idx = layer_indices(cfg, l);
+        let g1 = &p.data[idx.rms1];
+        let wq = &p.data[idx.wq];
+        let wk = &p.data[idx.wk];
+        let wv = &p.data[idx.wv];
+        let wo = &p.data[idx.wo];
+        let g2 = &p.data[idx.rms2];
+        let wg = &p.data[idx.w_gate];
+        let wu = &p.data[idx.w_up];
+        let wd_ = &p.data[idx.w_down];
 
         let (r1, inv1) = rms_fwd(&x, n, d, g1, eps);
         let q = mm(&r1, n, d, wq, q_dim);
         let k = mm(&r1, n, d, wk, kv_dim);
         let v = mm(&r1, n, d, wv, kv_dim);
 
-        let mut qr = q;
-        let mut kr = k;
+        let (mut qr, q_unnorm, inv_q) = if cfg.ext_x3_qk_norm {
+            let mut q_normed = vec![T::ZERO; n * q_dim];
+            let mut invs = vec![T::ZERO; n * nq];
+            let qn_gamma = &p.data[idx.q_norm.unwrap()];
+            for h in 0..nq {
+                let mut q_head = vec![T::ZERO; n * dh];
+                for t in 0..n {
+                    q_head[t * dh..(t + 1) * dh].copy_from_slice(&q[t * q_dim + h * dh..t * q_dim + (h + 1) * dh]);
+                }
+                let gamma_h = &qn_gamma[h * dh..(h + 1) * dh];
+                let (normed_h, inv_h) = rms_fwd(&q_head, n, dh, gamma_h, eps);
+                for t in 0..n {
+                    q_normed[t * q_dim + h * dh..t * q_dim + (h + 1) * dh].copy_from_slice(&normed_h[t * dh..(t + 1) * dh]);
+                    invs[t * nq + h] = inv_h[t];
+                }
+            }
+            (q_normed, Some(q), Some(invs))
+        } else {
+            (q, None, None)
+        };
+
+        let (mut kr, k_unnorm, inv_k) = if cfg.ext_x3_qk_norm {
+            let mut k_normed = vec![T::ZERO; n * kv_dim];
+            let mut invs = vec![T::ZERO; n * nkv];
+            let kn_gamma = &p.data[idx.k_norm.unwrap()];
+            for h in 0..nkv {
+                let mut k_head = vec![T::ZERO; n * dh];
+                for t in 0..n {
+                    k_head[t * dh..(t + 1) * dh].copy_from_slice(&k[t * kv_dim + h * dh..t * kv_dim + (h + 1) * dh]);
+                }
+                let gamma_h = &kn_gamma[h * dh..(h + 1) * dh];
+                let (normed_h, inv_h) = rms_fwd(&k_head, n, dh, gamma_h, eps);
+                for t in 0..n {
+                    k_normed[t * kv_dim + h * dh..t * kv_dim + (h + 1) * dh].copy_from_slice(&normed_h[t * dh..(t + 1) * dh]);
+                    invs[t * nkv + h] = inv_h[t];
+                }
+            }
+            (k_normed, Some(k), Some(invs))
+        } else {
+            (k, None, None)
+        };
+
         apply_rope_heads(&mut qr, n, nq, dh, theta, false);
         apply_rope_heads(&mut kr, n, nkv, dh, theta, false);
 
@@ -130,6 +174,10 @@ pub fn chunked_loss_and_grad<T: Float>(
             x0: x,
             r1,
             inv1,
+            q_unnorm,
+            inv_q,
+            k_unnorm,
+            inv_k,
             qr,
             kr,
             v,
@@ -146,12 +194,12 @@ pub fn chunked_loss_and_grad<T: Float>(
     }
 
     // Final RMSNorm
-    let gf = &p.data[1 + 9 * cfg.n_layers];
+    let gf = &p.data[final_norm_idx(cfg)];
     let (xf, invf) = rms_fwd(&x, n, d, gf, eps);
     let head_weight = if cfg.tied_embeddings {
         embed
     } else {
-        &p.data[2 + 9 * cfg.n_layers]
+        &p.data[lm_head_idx(cfg)]
     };
 
     // ---------------- Chunked Loss & Backward ----------------
@@ -205,7 +253,7 @@ pub fn chunked_loss_and_grad<T: Float>(
         if cfg.tied_embeddings {
             mm_at_acc(&dlogits_chunk, c_len, vs, xf_chunk, d, &mut grads.data[0]);
         } else {
-            let head_idx = 2 + 9 * cfg.n_layers;
+            let head_idx = lm_head_idx(cfg);
             mm_at_acc(
                 &dlogits_chunk,
                 c_len,
@@ -230,18 +278,18 @@ pub fn chunked_loss_and_grad<T: Float>(
     }
 
     // ---------------- Backward Sweep Through Decoder Layers ----------------
-    let fb = 1 + 9 * cfg.n_layers;
+    let fb = final_norm_idx(cfg);
     let mut dgf = vec![T::ZERO; d];
     let mut dx = rms_bwd(&x, n, d, gf, &invf, &dxf, &mut dgf);
     add_into(&mut grads.data[fb], &dgf);
 
     for l in (0..cfg.n_layers).rev() {
-        let b = 1 + 9 * l;
+        let idx = layer_indices(cfg, l);
         let c = &caches[l];
 
         // FFN backward
-        let dhid = mm_bt(&dx, n, d, &p.data[b + 8], dff);
-        mm_at_acc(&c.hid, n, dff, &dx, d, &mut grads.data[b + 8]);
+        let dhid = mm_bt(&dx, n, d, &p.data[idx.w_down], dff);
+        mm_at_acc(&c.hid, n, dff, &dx, d, &mut grads.data[idx.w_down]);
 
         let mut dgate = vec![T::ZERO; n * dff];
         let mut dup = vec![T::ZERO; n * dff];
@@ -254,24 +302,24 @@ pub fn chunked_loss_and_grad<T: Float>(
             dup[i] = dhid[i] * (g * sig);
         }
 
-        mm_at_acc(&c.r2, n, d, &dup, dff, &mut grads.data[b + 7]);
-        mm_at_acc(&c.r2, n, d, &dgate, dff, &mut grads.data[b + 6]);
+        mm_at_acc(&c.r2, n, d, &dup, dff, &mut grads.data[idx.w_up]);
+        mm_at_acc(&c.r2, n, d, &dgate, dff, &mut grads.data[idx.w_gate]);
 
-        let dr2_gate = mm_bt(&dgate, n, dff, &p.data[b + 6], d);
-        let dr2_up = mm_bt(&dup, n, dff, &p.data[b + 7], d);
+        let dr2_gate = mm_bt(&dgate, n, dff, &p.data[idx.w_gate], d);
+        let dr2_up = mm_bt(&dup, n, dff, &p.data[idx.w_up], d);
         let mut dr2 = dr2_gate;
         add_into(&mut dr2, &dr2_up);
 
         let mut dg2 = vec![T::ZERO; d];
-        let dx1_ffn = rms_bwd(&c.x1, n, d, &p.data[b + 5], &c.inv2, &dr2, &mut dg2);
-        add_into(&mut grads.data[b + 5], &dg2);
+        let dx1_ffn = rms_bwd(&c.x1, n, d, &p.data[idx.rms2], &c.inv2, &dr2, &mut dg2);
+        add_into(&mut grads.data[idx.rms2], &dg2);
 
         let mut dx1 = dx;
         add_into(&mut dx1, &dx1_ffn);
 
         // Attention backward
-        let dmerged = mm_bt(&dx1, n, d, &p.data[b + 4], q_dim);
-        mm_at_acc(&c.merged, n, q_dim, &dx1, d, &mut grads.data[b + 4]);
+        let dmerged = mm_bt(&dx1, n, d, &p.data[idx.wo], q_dim);
+        mm_at_acc(&c.merged, n, q_dim, &dx1, d, &mut grads.data[idx.wo]);
 
         let (mut dqr, mut dkr, dv) =
             attention_backward(&c.qr, &c.kr, &c.v, &c.p, &dmerged, n, nq, nkv, dh, &valid);
@@ -279,21 +327,73 @@ pub fn chunked_loss_and_grad<T: Float>(
         apply_rope_heads(&mut dqr, n, nq, dh, theta, true);
         apply_rope_heads(&mut dkr, n, nkv, dh, theta, true);
 
-        mm_at_acc(&c.r1, n, d, &dqr, q_dim, &mut grads.data[b + 1]);
-        mm_at_acc(&c.r1, n, d, &dkr, kv_dim, &mut grads.data[b + 2]);
-        mm_at_acc(&c.r1, n, d, &dv, kv_dim, &mut grads.data[b + 3]);
+        if cfg.ext_x3_qk_norm {
+            let q_un = c.q_unnorm.as_ref().unwrap();
+            let inv_q = c.inv_q.as_ref().unwrap();
+            let qn_gamma = &p.data[idx.q_norm.unwrap()];
+            let mut dg_q = vec![T::ZERO; nq * dh];
+            let mut dq_un = vec![T::ZERO; n * q_dim];
+            for h in 0..nq {
+                let mut un_head = vec![T::ZERO; n * dh];
+                let mut dy_head = vec![T::ZERO; n * dh];
+                let mut inv_head = vec![T::ZERO; n];
+                for t in 0..n {
+                    un_head[t * dh..(t + 1) * dh].copy_from_slice(&q_un[t * q_dim + h * dh..t * q_dim + (h + 1) * dh]);
+                    dy_head[t * dh..(t + 1) * dh].copy_from_slice(&dqr[t * q_dim + h * dh..t * q_dim + (h + 1) * dh]);
+                    inv_head[t] = inv_q[t * nq + h];
+                }
+                let gamma_h = &qn_gamma[h * dh..(h + 1) * dh];
+                let mut dg_h = vec![T::ZERO; dh];
+                let dx_h = rms_bwd(&un_head, n, dh, gamma_h, &inv_head, &dy_head, &mut dg_h);
+                dg_q[h * dh..(h + 1) * dh].copy_from_slice(&dg_h);
+                for t in 0..n {
+                    dq_un[t * q_dim + h * dh..t * q_dim + (h + 1) * dh].copy_from_slice(&dx_h[t * dh..(t + 1) * dh]);
+                }
+            }
+            add_into(&mut grads.data[idx.q_norm.unwrap()], &dg_q);
+            dqr = dq_un;
 
-        let dr1_q = mm_bt(&dqr, n, q_dim, &p.data[b + 1], d);
-        let dr1_k = mm_bt(&dkr, n, kv_dim, &p.data[b + 2], d);
-        let dr1_v = mm_bt(&dv, n, kv_dim, &p.data[b + 3], d);
+            let k_un = c.k_unnorm.as_ref().unwrap();
+            let inv_k = c.inv_k.as_ref().unwrap();
+            let kn_gamma = &p.data[idx.k_norm.unwrap()];
+            let mut dg_k = vec![T::ZERO; nkv * dh];
+            let mut dk_un = vec![T::ZERO; n * kv_dim];
+            for h in 0..nkv {
+                let mut un_head = vec![T::ZERO; n * dh];
+                let mut dy_head = vec![T::ZERO; n * dh];
+                let mut inv_head = vec![T::ZERO; n];
+                for t in 0..n {
+                    un_head[t * dh..(t + 1) * dh].copy_from_slice(&k_un[t * kv_dim + h * dh..t * kv_dim + (h + 1) * dh]);
+                    dy_head[t * dh..(t + 1) * dh].copy_from_slice(&dkr[t * kv_dim + h * dh..t * kv_dim + (h + 1) * dh]);
+                    inv_head[t] = inv_k[t * nkv + h];
+                }
+                let gamma_h = &kn_gamma[h * dh..(h + 1) * dh];
+                let mut dg_h = vec![T::ZERO; dh];
+                let dx_h = rms_bwd(&un_head, n, dh, gamma_h, &inv_head, &dy_head, &mut dg_h);
+                dg_k[h * dh..(h + 1) * dh].copy_from_slice(&dg_h);
+                for t in 0..n {
+                    dk_un[t * kv_dim + h * dh..t * kv_dim + (h + 1) * dh].copy_from_slice(&dx_h[t * dh..(t + 1) * dh]);
+                }
+            }
+            add_into(&mut grads.data[idx.k_norm.unwrap()], &dg_k);
+            dkr = dk_un;
+        }
+
+        mm_at_acc(&c.r1, n, d, &dqr, q_dim, &mut grads.data[idx.wq]);
+        mm_at_acc(&c.r1, n, d, &dkr, kv_dim, &mut grads.data[idx.wk]);
+        mm_at_acc(&c.r1, n, d, &dv, kv_dim, &mut grads.data[idx.wv]);
+
+        let dr1_q = mm_bt(&dqr, n, q_dim, &p.data[idx.wq], d);
+        let dr1_k = mm_bt(&dkr, n, kv_dim, &p.data[idx.wk], d);
+        let dr1_v = mm_bt(&dv, n, kv_dim, &p.data[idx.wv], d);
 
         let mut dr1 = dr1_q;
         add_into(&mut dr1, &dr1_k);
         add_into(&mut dr1, &dr1_v);
 
         let mut dg1 = vec![T::ZERO; d];
-        let dx0_attn = rms_bwd(&c.x0, n, d, &p.data[b], &c.inv1, &dr1, &mut dg1);
-        add_into(&mut grads.data[b], &dg1);
+        let dx0_attn = rms_bwd(&c.x0, n, d, &p.data[idx.rms1], &c.inv1, &dr1, &mut dg1);
+        add_into(&mut grads.data[idx.rms1], &dg1);
 
         dx = dx1;
         add_into(&mut dx, &dx0_attn);
@@ -353,26 +453,60 @@ pub fn chunked_forward_loss<T: Float>(
     }
 
     for l in 0..cfg.n_layers {
-        let b = 1 + 9 * l;
-        let (g1, wq, wk, wv, wo, g2, wg, wu, wd_) = (
-            &p.data[b],
-            &p.data[b + 1],
-            &p.data[b + 2],
-            &p.data[b + 3],
-            &p.data[b + 4],
-            &p.data[b + 5],
-            &p.data[b + 6],
-            &p.data[b + 7],
-            &p.data[b + 8],
-        );
+        let idx = layer_indices(cfg, l);
+        let g1 = &p.data[idx.rms1];
+        let wq = &p.data[idx.wq];
+        let wk = &p.data[idx.wk];
+        let wv = &p.data[idx.wv];
+        let wo = &p.data[idx.wo];
+        let g2 = &p.data[idx.rms2];
+        let wg = &p.data[idx.w_gate];
+        let wu = &p.data[idx.w_up];
+        let wd_ = &p.data[idx.w_down];
 
         let (r1, _) = rms_fwd(&x, n, d, g1, eps);
         let q = mm(&r1, n, d, wq, q_dim);
         let k = mm(&r1, n, d, wk, kv_dim);
         let v = mm(&r1, n, d, wv, kv_dim);
 
-        let mut qr = q;
-        let mut kr = k;
+        let mut qr = if cfg.ext_x3_qk_norm {
+            let mut q_normed = vec![T::ZERO; n * q_dim];
+            let qn_gamma = &p.data[idx.q_norm.unwrap()];
+            for h in 0..nq {
+                let mut q_head = vec![T::ZERO; n * dh];
+                for t in 0..n {
+                    q_head[t * dh..(t + 1) * dh].copy_from_slice(&q[t * q_dim + h * dh..t * q_dim + (h + 1) * dh]);
+                }
+                let gamma_h = &qn_gamma[h * dh..(h + 1) * dh];
+                let (normed_h, _) = rms_fwd(&q_head, n, dh, gamma_h, eps);
+                for t in 0..n {
+                    q_normed[t * q_dim + h * dh..t * q_dim + (h + 1) * dh].copy_from_slice(&normed_h[t * dh..(t + 1) * dh]);
+                }
+            }
+            q_normed
+        } else {
+            q
+        };
+
+        let mut kr = if cfg.ext_x3_qk_norm {
+            let mut k_normed = vec![T::ZERO; n * kv_dim];
+            let kn_gamma = &p.data[idx.k_norm.unwrap()];
+            for h in 0..nkv {
+                let mut k_head = vec![T::ZERO; n * dh];
+                for t in 0..n {
+                    k_head[t * dh..(t + 1) * dh].copy_from_slice(&k[t * kv_dim + h * dh..t * kv_dim + (h + 1) * dh]);
+                }
+                let gamma_h = &kn_gamma[h * dh..(h + 1) * dh];
+                let (normed_h, _) = rms_fwd(&k_head, n, dh, gamma_h, eps);
+                for t in 0..n {
+                    k_normed[t * kv_dim + h * dh..t * kv_dim + (h + 1) * dh].copy_from_slice(&normed_h[t * dh..(t + 1) * dh]);
+                }
+            }
+            k_normed
+        } else {
+            k
+        };
+
         apply_rope_heads(&mut qr, n, nq, dh, theta, false);
         apply_rope_heads(&mut kr, n, nkv, dh, theta, false);
 
@@ -395,12 +529,12 @@ pub fn chunked_forward_loss<T: Float>(
         x = x2;
     }
 
-    let gf = &p.data[1 + 9 * cfg.n_layers];
+    let gf = &p.data[final_norm_idx(cfg)];
     let (xf, _) = rms_fwd(&x, n, d, gf, eps);
     let head_weight = if cfg.tied_embeddings {
         embed
     } else {
-        &p.data[2 + 9 * cfg.n_layers]
+        &p.data[lm_head_idx(cfg)]
     };
 
     let chunk_size = cfg.chunk_size.max(1);

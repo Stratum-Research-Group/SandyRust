@@ -39,10 +39,12 @@ impl AdapterTarget {
 
     pub fn dims(&self, cfg: &Config) -> (usize, usize) {
         // (d_out, d_in)
+        let q_dim = cfg.n_q_heads * cfg.head_dim();
+        let kv_dim = cfg.n_kv_heads * cfg.head_dim();
         match self {
-            AdapterTarget::Wq | AdapterTarget::Wk | AdapterTarget::Wv | AdapterTarget::Wo => {
-                (cfg.d_model, cfg.d_model)
-            }
+            AdapterTarget::Wq => (q_dim, cfg.d_model),
+            AdapterTarget::Wk | AdapterTarget::Wv => (kv_dim, cfg.d_model),
+            AdapterTarget::Wo => (cfg.d_model, q_dim),
             AdapterTarget::Wgate | AdapterTarget::Wup => (cfg.d_ff, cfg.d_model),
             AdapterTarget::Wdown => (cfg.d_model, cfg.d_ff),
         }

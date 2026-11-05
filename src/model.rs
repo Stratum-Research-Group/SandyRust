@@ -1,9 +1,8 @@
 //! 4-layer decoder stack (reference_v2): forward pass, seeded init, tensor inventory.
 
-use crate::attention::attention_ref;
 use crate::config::{Config, ConfigError};
 use crate::rng::Rng;
-use crate::tensor::ops::{add, matmul, mul, rms_norm, rope, silu};
+use crate::tensor::ops::{add, matmul, matmul_trans_b, mul, rms_norm, rope, silu};
 use crate::tensor::{Tensor, TensorError};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -310,6 +309,16 @@ impl Model {
             }
 
             let (q, k, v) = (matmul(&r, &l.wq)?, matmul(&r, &l.wk)?, matmul(&r, &l.wv)?);
+            let rope_freqs = if c.ext_x4_rope {
+                Some(crate::attention::rope_ext::compute_frequencies(dh, c.rope_theta as f64, c.rope_scaling.as_ref()))
+            } else {
+                None
+            };
+            let attn_scale = (1.0 / (dh as f32).sqrt()) * if c.ext_x4_rope {
+                crate::attention::rope_ext::yarn_temperature_scale(c.rope_scaling.as_ref())
+            } else {
+                1.0
+            };
             let mut merged = Tensor::zeros(&[t, c.n_q_heads * dh])?;
             for h in 0..c.n_q_heads {
                 let kvh = h / group;
@@ -320,7 +329,10 @@ impl Model {
                 } else {
                     q_col
                 };
-                let mut qh = rope(&q_normed, c.rope_theta, 0)?;
+                let mut qh = match &rope_freqs {
+                    Some(freqs) => crate::attention::rope_ext::rope_with_freqs(&q_normed, freqs, 0)?,
+                    None => rope(&q_normed, c.rope_theta, 0)?,
+                };
 
                 // Site 4a: Q
                 if let Some(hook_ctx) = ctx {
@@ -352,7 +364,10 @@ impl Model {
                     }
                 }
 
-                let mut kh = rope(&k_normed, c.rope_theta, 0)?;
+                let mut kh = match &rope_freqs {
+                    Some(freqs) => crate::attention::rope_ext::rope_with_freqs(&k_normed, freqs, 0)?,
+                    None => rope(&k_normed, c.rope_theta, 0)?,
+                };
 
                 // Site 4c: K
                 if let Some(hook_ctx) = ctx {
@@ -384,7 +399,7 @@ impl Model {
                     }
                 }
 
-                let (mut o, probs) = attention_ref(&qh, &kh, &vh, valid, valid, 0)?;
+                let (mut o, probs) = crate::attention::attention_ref_scaled(&qh, &kh, &vh, valid, valid, 0, attn_scale)?;
 
                 // Site 6: AttnPattern
                 if let Some(hook_ctx) = ctx {
@@ -532,7 +547,7 @@ impl Model {
             Some(h) => h,
             None => &self.embed,
         };
-        let mut logits = matmul(&final_x, &head_mat.transpose2d()?)?;
+        let mut logits = matmul_trans_b(&final_x, head_mat)?;
 
         // Site 12b: Logits
         if let Some(hook_ctx) = ctx {

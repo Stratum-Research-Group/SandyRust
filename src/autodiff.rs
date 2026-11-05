@@ -211,6 +211,10 @@ struct LayerCache<T> {
     x0: Vec<T>,
     r1: Vec<T>,
     inv1: Vec<T>,
+    q_unnorm: Option<Vec<T>>,
+    inv_q: Option<Vec<T>>,
+    k_unnorm: Option<Vec<T>>,
+    inv_k: Option<Vec<T>>,
     qr: Vec<T>,
     kr: Vec<T>,
     v: Vec<T>,
@@ -222,6 +226,63 @@ struct LayerCache<T> {
     gate: Vec<T>,
     up: Vec<T>,
     hid: Vec<T>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LayerParamIndices {
+    pub rms1: usize,
+    pub wq: usize,
+    pub wk: usize,
+    pub wv: usize,
+    pub q_norm: Option<usize>,
+    pub k_norm: Option<usize>,
+    pub wo: usize,
+    pub rms2: usize,
+    pub w_gate: usize,
+    pub w_up: usize,
+    pub w_down: usize,
+}
+
+pub fn layer_indices(cfg: &Config, l: usize) -> LayerParamIndices {
+    let stride = if cfg.ext_x3_qk_norm { 11 } else { 9 };
+    let b = 1 + stride * l;
+    if cfg.ext_x3_qk_norm {
+        LayerParamIndices {
+            rms1: b,
+            wq: b + 1,
+            wk: b + 2,
+            wv: b + 3,
+            q_norm: Some(b + 4),
+            k_norm: Some(b + 5),
+            wo: b + 6,
+            rms2: b + 7,
+            w_gate: b + 8,
+            w_up: b + 9,
+            w_down: b + 10,
+        }
+    } else {
+        LayerParamIndices {
+            rms1: b,
+            wq: b + 1,
+            wk: b + 2,
+            wv: b + 3,
+            q_norm: None,
+            k_norm: None,
+            wo: b + 4,
+            rms2: b + 5,
+            w_gate: b + 6,
+            w_up: b + 7,
+            w_down: b + 8,
+        }
+    }
+}
+
+pub fn final_norm_idx(cfg: &Config) -> usize {
+    1 + (if cfg.ext_x3_qk_norm { 11 } else { 9 }) * cfg.n_layers
+}
+
+pub fn lm_head_idx(cfg: &Config) -> usize {
+    2 + (if cfg.ext_x3_qk_norm { 11 } else { 9 }) * cfg.n_layers
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -287,27 +348,62 @@ pub fn loss_and_grad<T: Float>(
     }
     let mut caches: Vec<LayerCache<T>> = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
-        let b = 1 + 9 * l;
-        let (g1, wq, wk, wv, wo, g2, wg, wu, wd_) =
-            (&p.data[b], &p.data[b + 1], &p.data[b + 2], &p.data[b + 3], &p.data[b + 4], &p.data[b + 5], &p.data[b + 6], &p.data[b + 7], &p.data[b + 8]);
+        let idx = layer_indices(cfg, l);
+        let g1 = &p.data[idx.rms1];
+        let wq = &p.data[idx.wq];
+        let wk = &p.data[idx.wk];
+        let wv = &p.data[idx.wv];
+        let wo = &p.data[idx.wo];
+        let g2 = &p.data[idx.rms2];
+        let wg = &p.data[idx.w_gate];
+        let wu = &p.data[idx.w_up];
+        let wd_ = &p.data[idx.w_down];
+
         let (r1, inv1) = rms_fwd(&x, n, d, g1, eps);
         let q = mm(&r1, n, d, wq, qd);
         let k = mm(&r1, n, d, wk, kd);
         let v = mm(&r1, n, d, wv, kd);
+
+        let mut q_unnorm = if cfg.ext_x3_qk_norm { Some(vec![T::ZERO; hq * n * dh]) } else { None };
+        let mut inv_q = if cfg.ext_x3_qk_norm { Some(vec![T::ZERO; hq * n]) } else { None };
         let mut qr = vec![T::ZERO; hq * n * dh];
         for h in 0..hq {
+            let mut q_head = vec![T::ZERO; n * dh];
             for t in 0..n {
-                qr[h * n * dh + t * dh..h * n * dh + (t + 1) * dh].copy_from_slice(&q[t * qd + h * dh..t * qd + (h + 1) * dh]);
+                q_head[t * dh..(t + 1) * dh].copy_from_slice(&q[t * qd + h * dh..t * qd + (h + 1) * dh]);
+            }
+            if cfg.ext_x3_qk_norm {
+                let qn_gamma = &p.data[idx.q_norm.unwrap()][h * dh..(h + 1) * dh];
+                let (normed, invs) = rms_fwd(&q_head, n, dh, qn_gamma, T::from_f64(cfg.rms_eps as f64));
+                q_unnorm.as_mut().unwrap()[h * n * dh..(h + 1) * n * dh].copy_from_slice(&q_head);
+                inv_q.as_mut().unwrap()[h * n..(h + 1) * n].copy_from_slice(&invs);
+                qr[h * n * dh..(h + 1) * n * dh].copy_from_slice(&normed);
+            } else {
+                qr[h * n * dh..(h + 1) * n * dh].copy_from_slice(&q_head);
             }
             rope_apply(&mut qr[h * n * dh..(h + 1) * n * dh], n, dh, cfg.rope_theta, false);
         }
+
+        let mut k_unnorm = if cfg.ext_x3_qk_norm { Some(vec![T::ZERO; hkv * n * dh]) } else { None };
+        let mut inv_k = if cfg.ext_x3_qk_norm { Some(vec![T::ZERO; hkv * n]) } else { None };
         let mut kr = vec![T::ZERO; hkv * n * dh];
         for h in 0..hkv {
+            let mut k_head = vec![T::ZERO; n * dh];
             for t in 0..n {
-                kr[h * n * dh + t * dh..h * n * dh + (t + 1) * dh].copy_from_slice(&k[t * kd + h * dh..t * kd + (h + 1) * dh]);
+                k_head[t * dh..(t + 1) * dh].copy_from_slice(&k[t * kd + h * dh..t * kd + (h + 1) * dh]);
+            }
+            if cfg.ext_x3_qk_norm {
+                let kn_gamma = &p.data[idx.k_norm.unwrap()][h * dh..(h + 1) * dh];
+                let (normed, invs) = rms_fwd(&k_head, n, dh, kn_gamma, T::from_f64(cfg.rms_eps as f64));
+                k_unnorm.as_mut().unwrap()[h * n * dh..(h + 1) * n * dh].copy_from_slice(&k_head);
+                inv_k.as_mut().unwrap()[h * n..(h + 1) * n].copy_from_slice(&invs);
+                kr[h * n * dh..(h + 1) * n * dh].copy_from_slice(&normed);
+            } else {
+                kr[h * n * dh..(h + 1) * n * dh].copy_from_slice(&k_head);
             }
             rope_apply(&mut kr[h * n * dh..(h + 1) * n * dh], n, dh, cfg.rope_theta, false);
         }
+
         let mut pm = vec![T::ZERO; hq * n * n];
         let mut merged = vec![T::ZERO; n * qd];
         for h in 0..hq {
@@ -367,15 +463,34 @@ pub fn loss_and_grad<T: Float>(
         let f = mm(&hid, n, dff, wd_, d);
         let mut x2 = x1.clone();
         add_into(&mut x2, &f);
-        caches.push(LayerCache { x0: x, r1, inv1, qr, kr, v, p: pm, merged, x1, r2, inv2, gate, up, hid });
+        caches.push(LayerCache {
+            x0: x,
+            r1,
+            inv1,
+            q_unnorm,
+            inv_q,
+            k_unnorm,
+            inv_k,
+            qr,
+            kr,
+            v,
+            p: pm,
+            merged,
+            x1,
+            r2,
+            inv2,
+            gate,
+            up,
+            hid,
+        });
         x = x2;
     }
-    let gf = &p.data[1 + 9 * cfg.n_layers];
+    let gf = &p.data[final_norm_idx(cfg)];
     let (xf, invf) = rms_fwd(&x, n, d, gf, eps);
     let head_weight = if cfg.tied_embeddings {
         embed
     } else {
-        &p.data[2 + 9 * cfg.n_layers]
+        &p.data[lm_head_idx(cfg)]
     };
     let logits = mm_bt(&xf, n, d, head_weight, vs);
 
@@ -419,20 +534,20 @@ pub fn loss_and_grad<T: Float>(
     if cfg.tied_embeddings {
         mm_at_acc(&dlogits, n, vs, &xf, d, &mut grads.data[0]); // head path of tied E
     } else {
-        let head_idx = 2 + 9 * cfg.n_layers;
+        let head_idx = lm_head_idx(cfg);
         mm_at_acc(&dlogits, n, vs, &xf, d, &mut grads.data[head_idx]); // separate W_head gradient
     }
-    let fb = 1 + 9 * cfg.n_layers;
+    let fb = final_norm_idx(cfg);
     let mut dgf = vec![T::ZERO; d];
     let mut dx = rms_bwd(&x, n, d, gf, &invf, &dxf, &mut dgf);
     add_into(&mut grads.data[fb], &dgf);
 
     for l in (0..cfg.n_layers).rev() {
-        let b = 1 + 9 * l;
+        let idx = layer_indices(cfg, l);
         let c = &caches[l];
         // FFN
-        let dhid = mm_bt(&dx, n, d, &p.data[b + 8], dff);
-        mm_at_acc(&c.hid, n, dff, &dx, d, &mut grads.data[b + 8]);
+        let dhid = mm_bt(&dx, n, d, &p.data[idx.w_down], dff);
+        mm_at_acc(&c.hid, n, dff, &dx, d, &mut grads.data[idx.w_down]);
         let mut dgate = vec![T::ZERO; n * dff];
         let mut dup = vec![T::ZERO; n * dff];
         for i in 0..n * dff {
@@ -441,17 +556,17 @@ pub fn loss_and_grad<T: Float>(
             dup[i] = dhid[i] * g * sg;
             dgate[i] = dhid[i] * c.up[i] * sg * (T::ONE + g * (T::ONE - sg));
         }
-        let mut dr2 = mm_bt(&dgate, n, dff, &p.data[b + 6], d);
-        add_into(&mut dr2, &mm_bt(&dup, n, dff, &p.data[b + 7], d));
-        mm_at_acc(&c.r2, n, d, &dgate, dff, &mut grads.data[b + 6]);
-        mm_at_acc(&c.r2, n, d, &dup, dff, &mut grads.data[b + 7]);
+        let mut dr2 = mm_bt(&dgate, n, dff, &p.data[idx.w_gate], d);
+        add_into(&mut dr2, &mm_bt(&dup, n, dff, &p.data[idx.w_up], d));
+        mm_at_acc(&c.r2, n, d, &dgate, dff, &mut grads.data[idx.w_gate]);
+        mm_at_acc(&c.r2, n, d, &dup, dff, &mut grads.data[idx.w_up]);
         let mut dg2 = vec![T::ZERO; d];
         let mut dx1 = dx;
-        add_into(&mut dx1, &rms_bwd(&c.x1, n, d, &p.data[b + 5], &c.inv2, &dr2, &mut dg2));
-        add_into(&mut grads.data[b + 5], &dg2);
+        add_into(&mut dx1, &rms_bwd(&c.x1, n, d, &p.data[idx.rms2], &c.inv2, &dr2, &mut dg2));
+        add_into(&mut grads.data[idx.rms2], &dg2);
         // attention
-        let dmerged = mm_bt(&dx1, n, d, &p.data[b + 4], qd);
-        mm_at_acc(&c.merged, n, qd, &dx1, d, &mut grads.data[b + 4]);
+        let dmerged = mm_bt(&dx1, n, d, &p.data[idx.wo], qd);
+        mm_at_acc(&c.merged, n, qd, &dx1, d, &mut grads.data[idx.wo]);
         let mut dqr = vec![T::ZERO; hq * n * dh];
         let mut dkr = vec![T::ZERO; hkv * n * dh];
         let mut dv = vec![T::ZERO; n * kd];
@@ -493,27 +608,63 @@ pub fn loss_and_grad<T: Float>(
         let mut dq = vec![T::ZERO; n * qd];
         for h in 0..hq {
             rope_apply(&mut dqr[h * n * dh..(h + 1) * n * dh], n, dh, cfg.rope_theta, true);
+            let dqr_h = if cfg.ext_x3_qk_norm {
+                let qn_idx = idx.q_norm.unwrap();
+                let gamma_q = &p.data[qn_idx][h * dh..(h + 1) * dh];
+                let mut dg_h = vec![T::ZERO; dh];
+                let dq_unnorm = rms_bwd(
+                    &c.q_unnorm.as_ref().unwrap()[h * n * dh..(h + 1) * n * dh],
+                    n,
+                    dh,
+                    gamma_q,
+                    &c.inv_q.as_ref().unwrap()[h * n..(h + 1) * n],
+                    &dqr[h * n * dh..(h + 1) * n * dh],
+                    &mut dg_h,
+                );
+                add_into(&mut grads.data[qn_idx][h * dh..(h + 1) * dh], &dg_h);
+                dq_unnorm
+            } else {
+                dqr[h * n * dh..(h + 1) * n * dh].to_vec()
+            };
             for t in 0..n {
-                dq[t * qd + h * dh..t * qd + (h + 1) * dh].copy_from_slice(&dqr[h * n * dh + t * dh..h * n * dh + (t + 1) * dh]);
+                dq[t * qd + h * dh..t * qd + (h + 1) * dh].copy_from_slice(&dqr_h[t * dh..(t + 1) * dh]);
             }
         }
         let mut dk = vec![T::ZERO; n * kd];
         for h in 0..hkv {
             rope_apply(&mut dkr[h * n * dh..(h + 1) * n * dh], n, dh, cfg.rope_theta, true);
+            let dkr_h = if cfg.ext_x3_qk_norm {
+                let kn_idx = idx.k_norm.unwrap();
+                let gamma_k = &p.data[kn_idx][h * dh..(h + 1) * dh];
+                let mut dg_h = vec![T::ZERO; dh];
+                let dk_unnorm = rms_bwd(
+                    &c.k_unnorm.as_ref().unwrap()[h * n * dh..(h + 1) * n * dh],
+                    n,
+                    dh,
+                    gamma_k,
+                    &c.inv_k.as_ref().unwrap()[h * n..(h + 1) * n],
+                    &dkr[h * n * dh..(h + 1) * n * dh],
+                    &mut dg_h,
+                );
+                add_into(&mut grads.data[kn_idx][h * dh..(h + 1) * dh], &dg_h);
+                dk_unnorm
+            } else {
+                dkr[h * n * dh..(h + 1) * n * dh].to_vec()
+            };
             for t in 0..n {
-                dk[t * kd + h * dh..t * kd + (h + 1) * dh].copy_from_slice(&dkr[h * n * dh + t * dh..h * n * dh + (t + 1) * dh]);
+                dk[t * kd + h * dh..t * kd + (h + 1) * dh].copy_from_slice(&dkr_h[t * dh..(t + 1) * dh]);
             }
         }
-        let mut dr1 = mm_bt(&dq, n, qd, &p.data[b + 1], d);
-        add_into(&mut dr1, &mm_bt(&dk, n, kd, &p.data[b + 2], d));
-        add_into(&mut dr1, &mm_bt(&dv, n, kd, &p.data[b + 3], d));
-        mm_at_acc(&c.r1, n, d, &dq, qd, &mut grads.data[b + 1]);
-        mm_at_acc(&c.r1, n, d, &dk, kd, &mut grads.data[b + 2]);
-        mm_at_acc(&c.r1, n, d, &dv, kd, &mut grads.data[b + 3]);
+        let mut dr1 = mm_bt(&dq, n, qd, &p.data[idx.wq], d);
+        add_into(&mut dr1, &mm_bt(&dk, n, kd, &p.data[idx.wk], d));
+        add_into(&mut dr1, &mm_bt(&dv, n, kd, &p.data[idx.wv], d));
+        mm_at_acc(&c.r1, n, d, &dq, qd, &mut grads.data[idx.wq]);
+        mm_at_acc(&c.r1, n, d, &dk, kd, &mut grads.data[idx.wk]);
+        mm_at_acc(&c.r1, n, d, &dv, kd, &mut grads.data[idx.wv]);
         let mut dg1 = vec![T::ZERO; d];
         let mut dx0 = dx1;
-        add_into(&mut dx0, &rms_bwd(&c.x0, n, d, &p.data[b], &c.inv1, &dr1, &mut dg1));
-        add_into(&mut grads.data[b], &dg1);
+        add_into(&mut dx0, &rms_bwd(&c.x0, n, d, &p.data[idx.rms1], &c.inv1, &dr1, &mut dg1));
+        add_into(&mut grads.data[idx.rms1], &dg1);
         dx = dx0;
     }
     // embedding lookup path (scatter-add) accumulates into the same shared E gradient
@@ -575,24 +726,48 @@ pub fn forward_loss<T: Float>(
         x[t * d..(t + 1) * d].copy_from_slice(&embed[id * d..(id + 1) * d]);
     }
     for l in 0..cfg.n_layers {
-        let b = 1 + 9 * l;
-        let (g1, wq, wk, wv, wo, g2, wg, wu, wd_) =
-            (&p.data[b], &p.data[b + 1], &p.data[b + 2], &p.data[b + 3], &p.data[b + 4], &p.data[b + 5], &p.data[b + 6], &p.data[b + 7], &p.data[b + 8]);
+        let idx = layer_indices(cfg, l);
+        let g1 = &p.data[idx.rms1];
+        let wq = &p.data[idx.wq];
+        let wk = &p.data[idx.wk];
+        let wv = &p.data[idx.wv];
+        let wo = &p.data[idx.wo];
+        let g2 = &p.data[idx.rms2];
+        let wg = &p.data[idx.w_gate];
+        let wu = &p.data[idx.w_up];
+        let wd_ = &p.data[idx.w_down];
+
         let (r1, _) = rms_fwd(&x, n, d, g1, eps);
         let q = mm(&r1, n, d, wq, qd);
         let k = mm(&r1, n, d, wk, kd);
         let v = mm(&r1, n, d, wv, kd);
         let mut qr = vec![T::ZERO; hq * n * dh];
         for h in 0..hq {
+            let mut q_head = vec![T::ZERO; n * dh];
             for t in 0..n {
-                qr[h * n * dh + t * dh..h * n * dh + (t + 1) * dh].copy_from_slice(&q[t * qd + h * dh..t * qd + (h + 1) * dh]);
+                q_head[t * dh..(t + 1) * dh].copy_from_slice(&q[t * qd + h * dh..t * qd + (h + 1) * dh]);
+            }
+            if cfg.ext_x3_qk_norm {
+                let qn_gamma = &p.data[idx.q_norm.unwrap()][h * dh..(h + 1) * dh];
+                let (normed, _) = rms_fwd(&q_head, n, dh, qn_gamma, T::from_f64(cfg.rms_eps as f64));
+                qr[h * n * dh..(h + 1) * n * dh].copy_from_slice(&normed);
+            } else {
+                qr[h * n * dh..(h + 1) * n * dh].copy_from_slice(&q_head);
             }
             rope_apply(&mut qr[h * n * dh..(h + 1) * n * dh], n, dh, cfg.rope_theta, false);
         }
         let mut kr = vec![T::ZERO; hkv * n * dh];
         for h in 0..hkv {
+            let mut k_head = vec![T::ZERO; n * dh];
             for t in 0..n {
-                kr[h * n * dh + t * dh..h * n * dh + (t + 1) * dh].copy_from_slice(&k[t * kd + h * dh..t * kd + (h + 1) * dh]);
+                k_head[t * dh..(t + 1) * dh].copy_from_slice(&k[t * kd + h * dh..t * kd + (h + 1) * dh]);
+            }
+            if cfg.ext_x3_qk_norm {
+                let kn_gamma = &p.data[idx.k_norm.unwrap()][h * dh..(h + 1) * dh];
+                let (normed, _) = rms_fwd(&k_head, n, dh, kn_gamma, T::from_f64(cfg.rms_eps as f64));
+                kr[h * n * dh..(h + 1) * n * dh].copy_from_slice(&normed);
+            } else {
+                kr[h * n * dh..(h + 1) * n * dh].copy_from_slice(&k_head);
             }
             rope_apply(&mut kr[h * n * dh..(h + 1) * n * dh], n, dh, cfg.rope_theta, false);
         }
@@ -651,12 +826,12 @@ pub fn forward_loss<T: Float>(
         add_into(&mut x2, &f);
         x = x2;
     }
-    let gf = &p.data[1 + 9 * cfg.n_layers];
+    let gf = &p.data[final_norm_idx(cfg)];
     let (xf, _) = rms_fwd(&x, n, d, gf, eps);
     let head_weight = if cfg.tied_embeddings {
         embed
     } else {
-        &p.data[2 + 9 * cfg.n_layers]
+        &p.data[lm_head_idx(cfg)]
     };
     let logits = mm_bt(&xf, n, d, head_weight, vs);
 

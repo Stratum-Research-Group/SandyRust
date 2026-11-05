@@ -5,6 +5,7 @@ use sandy_rust::gates;
 use sandy_rust::generation::{generate, SamplingParams};
 use sandy_rust::model::Model;
 use sandy_rust::optimizer::{AdamW, Schedule};
+use sandy_rust::rng::Rng;
 use sandy_rust::tokenizer::{ByteTokenizer, BOS};
 use std::{env, fs, path::Path, process::ExitCode, str::FromStr};
 
@@ -113,7 +114,7 @@ fn main() -> ExitCode {
     let cfg = Config::reference_v2();
     match args.first().map(String::as_str) {
         Some("verify") => {
-            let default_gates = "g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14,gx12e,gx13,gx14,gx15,gx17";
+            let default_gates = "g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11,g12,g13,g14,gx1,gx2,gx3,gx4,gx5,gx6,gx7,gx8,gx12e,gx13,gx14,gx15,gx17";
             let gates_flag = match flag(&args, "--gates") {
                 Ok(v) => v,
                 Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
@@ -677,6 +678,7 @@ fn main() -> ExitCode {
             };
             let mut p = sandy_rust::autodiff::Params::<f32>::from_model(&m);
             let mut opt = AdamW::new(&p);
+            let mut train_rng = Rng::new(cfg.seed);
             let mut start_step = 1usize;
             let mut sched = Schedule { eta_max: lr, eta_min: lr * 0.1, warmup: (steps / 5).max(1) as u64, max_steps: steps as u64 };
 
@@ -700,6 +702,7 @@ fn main() -> ExitCode {
                 p = sandy_rust::autodiff::Params::<f32>::from_model(&m);
                 opt = state.optimizer;
                 sched = state.schedule;
+                train_rng = Rng::from_state(state.rng_state.0, state.rng_state.1, state.rng_state.2);
                 if let Err(e) = train_loader.restore(state.loader_state) {
                     eprintln!("loader restore error: {e:?}");
                     return ExitCode::FAILURE;
@@ -779,7 +782,7 @@ fn main() -> ExitCode {
                     model: updated_model,
                     optimizer: opt.clone(),
                     loader_state: train_loader.state(),
-                    rng_state: ([0u32; 16], [0u32; 16], 0),
+                    rng_state: train_rng.dump_state(),
                     schedule_step: opt.step as usize,
                     schedule: sched,
                 };
@@ -899,6 +902,10 @@ fn main() -> ExitCode {
                         Ok(None) => "test",
                         Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
                     };
+                    let ckpt_opt = match flag(&args, "--checkpoint") {
+                        Ok(c) => c,
+                        Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+                    };
                     println!("Running Paired Perturbation & Flip-Rate Evaluation (task: {task}, split: {split})...");
 
                     let mut families = Vec::new();
@@ -936,14 +943,41 @@ fn main() -> ExitCode {
                     let pairs: Vec<&sandy_rust::eval::Pair> = target_families.iter().flat_map(|f| &f.pairs).collect();
                     println!("Evaluated {} families, {} pairs on split '{}'", target_families.len(), pairs.len(), split);
 
-                    let oracle_preds: Vec<(&sandy_rust::eval::Pair, sandy_rust::eval::PredictionResult)> = pairs.iter().map(|p| {
-                        (*p, sandy_rust::eval::PredictionResult {
-                            model_base_answer: p.oracle_base_answer.clone(),
-                            model_variant_answer: p.oracle_variant_answer.clone(),
-                        })
-                    }).collect();
+                    let preds: Vec<(&sandy_rust::eval::Pair, sandy_rust::eval::PredictionResult)> = if let Some(ref ckpt_path) = ckpt_opt {
+                        let model = match sandy_rust::checkpoint::load(std::path::Path::new(ckpt_path), &cfg, DEFAULT_MAX_BYTES) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                eprintln!("failed to load checkpoint '{ckpt_path}': {e:?}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let tok = sandy_rust::tokenizer::ByteTokenizer;
+                        let sp = sandy_rust::generation::SamplingParams {
+                            max_new_tokens: 8,
+                            temperature: 0.0,
+                            ..Default::default()
+                        };
+                        println!("Generating model predictions for {} pairs...", pairs.len());
+                        pairs.iter().map(|p| {
+                            let b_enc = tok.encode(&p.base_prompt);
+                            let v_enc = tok.encode(&p.variant_prompt);
+                            let b_gen = sandy_rust::generation::generate(&model, &b_enc, &sp).map(|o| tok.decode(&o.tokens).unwrap_or_default()).unwrap_or_default();
+                            let v_gen = sandy_rust::generation::generate(&model, &v_enc, &sp).map(|o| tok.decode(&o.tokens).unwrap_or_default()).unwrap_or_default();
+                            (*p, sandy_rust::eval::PredictionResult {
+                                model_base_answer: b_gen.trim().to_string(),
+                                model_variant_answer: v_gen.trim().to_string(),
+                            })
+                        }).collect()
+                    } else {
+                        pairs.iter().map(|p| {
+                            (*p, sandy_rust::eval::PredictionResult {
+                                model_base_answer: p.oracle_base_answer.clone(),
+                                model_variant_answer: p.oracle_variant_answer.clone(),
+                            })
+                        }).collect()
+                    };
 
-                    let (flip_mf, flip_mnf, selectivity, base_acc, var_acc) = match sandy_rust::eval::evaluate_pairs(&oracle_preds) {
+                    let (flip_mf, flip_mnf, selectivity, base_acc, var_acc) = match sandy_rust::eval::evaluate_pairs(&preds) {
                         Ok(m) => m,
                         Err(e) => {
                             eprintln!("metrics computation error: {e}");
@@ -951,7 +985,7 @@ fn main() -> ExitCode {
                         }
                     };
 
-                    let ci = match sandy_rust::eval::family_clustered_bootstrap(&target_families, &oracle_preds, 2000, 20261007) {
+                    let ci = match sandy_rust::eval::family_clustered_bootstrap(&target_families, &preds, 2000, 20261007) {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("bootstrap error: {e}");
@@ -961,7 +995,11 @@ fn main() -> ExitCode {
 
                     let baselines = sandy_rust::eval::evaluate_trivial_baselines(&pairs);
 
-                    println!("--- Metrics (Oracle Reference) ---");
+                    if ckpt_opt.is_some() {
+                        println!("--- Model Evaluation Metrics ---");
+                    } else {
+                        println!("--- Metrics (Oracle Reference - pass --checkpoint <path> for model evaluation) ---");
+                    }
                     println!("Base Accuracy:       {:.2}%", base_acc * 100.0);
                     println!("Variant Accuracy:    {:.2}%", var_acc * 100.0);
                     println!("Must-Flip Flip Rate: {:.2}%", flip_mf * 100.0);
@@ -976,7 +1014,7 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 _ => {
-                    eprintln!("usage: sandy_rust eval flip [--task all|kv_lookup|copy_marker|digit_comparison|symbol_count] [--split train|dev|test]");
+                    eprintln!("usage: sandy_rust eval flip [--task all|kv_lookup|copy_marker|digit_comparison|symbol_count] [--split train|dev|test] [--checkpoint <path>]");
                     ExitCode::from(2)
                 }
             }
@@ -993,7 +1031,7 @@ fn main() -> ExitCode {
             eprintln!("  checkpoint  --init <path> | --inspect <path>");
             eprintln!("  generate    [--prompt s] [--prompt-ids list] [--import path] [--tokenizer path] [--max-tokens n] [--temperature t] [--top-k k] [--top-p p] [--seed n] [--checkpoint path]");
             eprintln!("  inspect     [--prompt s] [--mode record|steer] [--alpha f]");
-            eprintln!("  eval flip   [--task <name>] [--split <name>]");
+            eprintln!("  eval flip   [--task <name>] [--split <name>] [--checkpoint <path>]");
             ExitCode::from(2)
         }
     }

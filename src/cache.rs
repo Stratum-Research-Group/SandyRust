@@ -1,9 +1,8 @@
 //! Contiguous Key-Value Cache for autoregressive single-token decode (§8.3, Gate G7).
 
-use crate::attention::attention_ref;
 use crate::config::Config;
 use crate::model::{Model, ModelError};
-use crate::tensor::ops::{add, matmul, mul, rms_norm, rope, silu};
+use crate::tensor::ops::{add, matmul, matmul_trans_b, mul, rms_norm, rope, silu};
 use crate::tensor::{Tensor, TensorError};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +43,7 @@ pub struct KVCache {
     pub k: Vec<Tensor>,
     /// Per layer: value cache [max_seq_len, kv_dim]
     pub v: Vec<Tensor>,
+    pub bound_model_ptr: Option<usize>,
 }
 
 impl KVCache {
@@ -69,6 +69,7 @@ impl KVCache {
             seq_len: 0,
             k,
             v,
+            bound_model_ptr: None,
         })
     }
 
@@ -180,11 +181,15 @@ pub fn forward_step_with_hooks(
     mut sink: Option<&mut crate::hooks::ActivationSink>,
 ) -> Result<Tensor, ModelError> {
     let c = &model.cfg;
-    if cache.model_fingerprint != model.fingerprint() {
-        return Err(CacheError::BindingMismatch("model fingerprint mismatch").into());
-    }
-    if cache.config_fingerprint != c.fingerprint() {
-        return Err(CacheError::BindingMismatch("config fingerprint mismatch").into());
+    let model_ptr = (model as *const Model) as usize;
+    if cache.bound_model_ptr != Some(model_ptr) {
+        if cache.model_fingerprint != model.fingerprint() {
+            return Err(CacheError::BindingMismatch("model fingerprint mismatch").into());
+        }
+        if cache.config_fingerprint != c.fingerprint() {
+            return Err(CacheError::BindingMismatch("config fingerprint mismatch").into());
+        }
+        cache.bound_model_ptr = Some(model_ptr);
     }
     let active_policy_hash = ctx.map_or(crate::hooks::EMPTY_POLICY_HASH, |c| c.intervention_policy_hash());
     if cache.intervention_policy_hash != active_policy_hash {
@@ -232,6 +237,16 @@ pub fn forward_step_with_hooks(
     let k_len = pos + 1;
     let q_valid = [true];
     let k_valid = vec![true; k_len];
+    let rope_freqs = if c.ext_x4_rope {
+        Some(crate::attention::rope_ext::compute_frequencies(dh, c.rope_theta as f64, c.rope_scaling.as_ref()))
+    } else {
+        None
+    };
+    let attn_scale = (1.0 / (dh as f32).sqrt()) * if c.ext_x4_rope {
+        crate::attention::rope_ext::yarn_temperature_scale(c.rope_scaling.as_ref())
+    } else {
+        1.0
+    };
 
     for (l_idx, l) in model.layers.iter().enumerate() {
         let layer_u16 = l_idx as u16;
@@ -290,7 +305,10 @@ pub fn forward_step_with_hooks(
                 }
             }
 
-            let mut col_r = rope(&k_normed, c.rope_theta, pos)?;
+            let mut col_r = match &rope_freqs {
+                Some(freqs) => crate::attention::rope_ext::rope_with_freqs(&k_normed, freqs, pos)?,
+                None => rope(&k_normed, c.rope_theta, pos)?,
+            };
 
             // Site 4c: K
             if let Some(hook_ctx) = ctx {
@@ -352,7 +370,10 @@ pub fn forward_step_with_hooks(
             } else {
                 q_col
             };
-            let mut qh = rope(&q_normed, c.rope_theta, pos)?;
+            let mut qh = match &rope_freqs {
+                Some(freqs) => crate::attention::rope_ext::rope_with_freqs(&q_normed, freqs, pos)?,
+                None => rope(&q_normed, c.rope_theta, pos)?,
+            };
 
             // Site 4a: Q
             if let Some(hook_ctx) = ctx {
@@ -370,7 +391,7 @@ pub fn forward_step_with_hooks(
 
             let kh = slice_cols(&current_k_tensor, kvh * dh, dh)?;
             let vh = slice_cols(&current_v_tensor, kvh * dh, dh)?;
-            let (mut o, probs) = attention_ref(&qh, &kh, &vh, &q_valid, &k_valid, pos)?;
+            let (mut o, probs) = crate::attention::attention_ref_scaled(&qh, &kh, &vh, &q_valid, &k_valid, pos, attn_scale)?;
 
             // Site 6: AttnPattern
             if let Some(hook_ctx) = ctx {
@@ -515,7 +536,7 @@ pub fn forward_step_with_hooks(
         Some(h) => h,
         None => &model.embed,
     };
-    let mut logits = matmul(&final_x, &head_mat.transpose2d()?)?;
+    let mut logits = matmul_trans_b(&final_x, head_mat)?;
 
     // Site 12b: Logits
     if let Some(hook_ctx) = ctx {

@@ -30,6 +30,20 @@ pub fn attention_ref(
     k_valid: &[bool],
     offset: usize,
 ) -> Result<(Tensor, Vec<f32>), TensorError> {
+    let dh = q.shape().get(1).copied().unwrap_or(0);
+    let scale = if dh > 0 { 1.0 / (dh as f32).sqrt() } else { 1.0 };
+    attention_ref_scaled(q, k, v, q_valid, k_valid, offset, scale)
+}
+
+pub fn attention_ref_scaled(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    q_valid: &[bool],
+    k_valid: &[bool],
+    offset: usize,
+    scale: f32,
+) -> Result<(Tensor, Vec<f32>), TensorError> {
     if q.shape().len() != 2 {
         return Err(TensorError::Rank { expected: 2, actual: q.shape().len() });
     }
@@ -83,7 +97,6 @@ pub fn attention_ref(
         }
     }
 
-    let scale = 1.0 / (dh as f32).sqrt();
     let mut probs = vec![0.0f32; tq * tk];
     let mut out = Tensor::zeros(&[tq, dv])?;
 

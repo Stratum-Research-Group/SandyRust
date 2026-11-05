@@ -1242,7 +1242,7 @@ pub fn deserialize_rimp(
             cap: max_bytes,
         });
     }
-    if data.len() < 4 + 4 + 32 + (13 * 4) + 32 + 32 + 4 + 32 {
+    if data.len() < 4 + 4 + 32 + (14 * 4 + 8) + 32 + 32 + 4 + 32 {
         return Err(ImportError::BadHeader(
             "RIMP file shorter than minimum header size".to_string(),
         ));
@@ -1471,8 +1471,12 @@ pub fn deserialize_rimp(
             });
         }
 
-        let tensor_start = payload_start + entry.off;
-        let tensor_end = tensor_start + entry.len;
+        let tensor_start = payload_start
+            .checked_add(entry.off)
+            .ok_or_else(|| ImportError::OffsetOutOfBounds { name: entry.name.clone() })?;
+        let tensor_end = tensor_start
+            .checked_add(entry.len)
+            .ok_or_else(|| ImportError::OffsetOutOfBounds { name: entry.name.clone() })?;
         if tensor_end > content_len {
             return Err(ImportError::OffsetOutOfBounds {
                 name: entry.name.clone(),

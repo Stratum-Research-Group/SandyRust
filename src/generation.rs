@@ -413,6 +413,85 @@ pub fn generate(model: &Model, prompt: &[u32], p: &SamplingParams) -> Result<Gen
     })
 }
 
+/// Autoregressive generation using `KVCache` incremental single-token decoding (§8.3, F-04).
+///
+/// Prefills prompt tokens into a `KVCache` and executes single-token decode steps via
+/// `cache::forward_step` ($O(T)$ per step instead of $O(T^2)$ full sequence re-evaluations).
+pub fn generate_cached(
+    model: &Model,
+    prompt: &[u32],
+    p: &SamplingParams,
+) -> Result<GenerationOutput, GenerationError> {
+    p.validate()?;
+    let max_len = model.cfg.max_seq_len;
+    if prompt.is_empty() {
+        return Err(GenerationError::PromptEmpty);
+    }
+    if prompt.len() > max_len {
+        return Err(GenerationError::PromptExceedsContext { prompt_len: prompt.len(), max_len });
+    }
+    if p.max_new_tokens == 0 {
+        return Err(GenerationError::InvalidParameter("max_new_tokens must be >= 1"));
+    }
+    let total = prompt
+        .len()
+        .checked_add(p.max_new_tokens)
+        .ok_or(GenerationError::CapacityExceeded { total_requested: usize::MAX, max_len })?;
+    if total > max_len {
+        return Err(GenerationError::CapacityExceeded { total_requested: total, max_len });
+    }
+
+    let mut cache = crate::cache::KVCache::new(&model.cfg, model.fingerprint(), p.seed)
+        .map_err(|e| GenerationError::Forward(format!("{e:?}")))?;
+
+    // Prefill prompt tokens into KV cache
+    let mut last_logits = Vec::new();
+    for (pos, &tok) in prompt.iter().enumerate() {
+        let step_logits = crate::cache::forward_step(model, tok, pos, &mut cache)
+            .map_err(|e| GenerationError::Forward(format!("{e:?}")))?;
+        if pos == prompt.len() - 1 {
+            last_logits = step_logits.data().to_vec();
+        }
+    }
+
+    let mut rng = Rng::new(p.seed);
+    let mut seq = prompt.to_vec();
+    let mut out = Vec::new();
+    let mut eos = false;
+    let mut adaptive_state = p.adaptive.as_ref().map(|_| AdaptiveSamplerState::new());
+
+    for _ in 0..p.max_new_tokens {
+        let pos = seq.len() - 1;
+        let next = sample_next_step(&last_logits, p, &mut adaptive_state, &mut rng, pos)?;
+        let eos_id = if model.cfg.ext_x17_import {
+            model.cfg.eos_id
+        } else {
+            EOS
+        };
+        if next == eos_id {
+            eos = true;
+            break;
+        }
+        seq.push(next);
+        out.push(next);
+
+        // Advance single token step through KV cache
+        let step_logits = crate::cache::forward_step(model, next, cache.seq_len, &mut cache)
+            .map_err(|e| GenerationError::Forward(format!("{e:?}")))?;
+        last_logits = step_logits.data().to_vec();
+    }
+
+    let terminal_pos = seq.len() - 1;
+
+    Ok(GenerationOutput {
+        tokens: out,
+        final_logits: last_logits,
+        stopped_on_eos: eos,
+        terminal_pos,
+        adaptive_state,
+    })
+}
+
 pub fn compute_distinct_n(tokens: &[u32], n: usize) -> f64 {
     if tokens.len() < n || n == 0 {
         return 0.0;
@@ -695,5 +774,27 @@ mod tests {
         let pos3 = full_seq3.len() - 1;
         assert_eq!(out3.terminal_pos, pos3);
         assert_eq!(out3.final_logits, &fwd3.data()[pos3 * v..(pos3 + 1) * v]);
+    }
+
+    #[test]
+    fn test_generate_cached_parity_with_full_generate() {
+        let m = model();
+        let prompt = [256u32, 65, 66];
+        let p = SamplingParams {
+            max_new_tokens: 4,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let out_full = generate(&m, &prompt, &p).unwrap();
+        let out_cached = generate_cached(&m, &prompt, &p).unwrap();
+
+        assert_eq!(out_full.tokens, out_cached.tokens, "generated tokens must match between full forward and KV cache");
+        assert_eq!(out_full.terminal_pos, out_cached.terminal_pos);
+
+        // Check logit closeness within numerical precision (1e-4)
+        for (i, (&a, &b)) in out_full.final_logits.iter().zip(&out_cached.final_logits).enumerate() {
+            let diff = (a - b).abs();
+            assert!(diff <= 1e-4 + 1e-4 * a.abs(), "token {i} logit mismatch: full={a}, cached={b}");
+        }
     }
 }

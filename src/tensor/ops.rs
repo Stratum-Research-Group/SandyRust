@@ -30,6 +30,31 @@ pub fn matmul(a: &Tensor, b: &Tensor) -> Result<Tensor, TensorError> {
     Ok(out)
 }
 
+/// `[m,k] x [n,k]^T -> [m,n]`.
+/// Computes `a * b^T` directly without allocating or transposing `b`.
+pub fn matmul_trans_b(a: &Tensor, b: &Tensor) -> Result<Tensor, TensorError> {
+    let (m, k) = rank2(a)?;
+    let (n, k2) = rank2(b)?;
+    if k != k2 {
+        return Err(TensorError::ShapeMismatch { expected: vec![n, k], actual: vec![n, k2] });
+    }
+    let mut out = Tensor::zeros(&[m, n])?;
+    let (ad, bd) = (a.data(), b.data());
+    let od = out.data_mut();
+    for i in 0..m {
+        let a_row = &ad[i * k..(i + 1) * k];
+        for j in 0..n {
+            let b_row = &bd[j * k..(j + 1) * k];
+            let mut s = 0.0f32;
+            for p in 0..k {
+                s += a_row[p] * b_row[p];
+            }
+            od[i * n + j] = s;
+        }
+    }
+    Ok(out)
+}
+
 fn zip(a: &Tensor, b: &Tensor, f: impl Fn(f32, f32) -> f32) -> Result<Tensor, TensorError> {
     if a.shape() != b.shape() {
         return Err(TensorError::ShapeMismatch {

@@ -230,3 +230,30 @@ fn test_x4_gate_gx4_execution() {
     assert_eq!(dispatched.len(), 1);
     assert_eq!(dispatched[0].status, "PASS");
 }
+
+#[test]
+fn test_x4_model_forward_and_cache_with_yarn() {
+    let cfg = Config::rope_yarn_v2(256);
+    let model = sandy_rust::model::Model::init(&cfg).unwrap();
+    let tokens = vec![1, 10, 25, 42, 100];
+    let logits_monolithic = model.forward(&tokens, None).unwrap();
+    assert_eq!(logits_monolithic.shape(), &[5, cfg.vocab_size]);
+
+    // Test with KVCache
+    let mut cache = sandy_rust::cache::KVCache::new(&model.cfg, model.fingerprint(), 1).unwrap();
+    let mut last_step_logits = None;
+    for (pos, &tok) in tokens.iter().enumerate() {
+        let l = sandy_rust::cache::forward_step(&model, tok, pos, &mut cache).unwrap();
+        last_step_logits = Some(l);
+    }
+    let last_step = last_step_logits.unwrap();
+    let final_mono_row = &logits_monolithic.data()[4 * cfg.vocab_size..5 * cfg.vocab_size];
+    for (i, (&a, &b)) in final_mono_row.iter().zip(last_step.data().iter()).enumerate() {
+        let diff = (a - b).abs();
+        assert!(
+            diff < 1e-4,
+            "mismatch between monolithic and KV-cached forward with YaRN at index {i}: {a} vs {b}"
+        );
+    }
+}
+
