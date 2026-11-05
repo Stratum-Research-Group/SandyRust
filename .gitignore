@@ -3,7 +3,6 @@
 *.tmp
 *.ckpt
 *.txt
-specv3.md
 models/
 *.rimp
 *.safetensors
