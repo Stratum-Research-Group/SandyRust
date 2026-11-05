@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bannerBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#14171E" />
+      <stop offset="50%" stop-color="#0E1014" />
+      <stop offset="100%" stop-color="#07080A" />
+    </linearGradient>
+
+    <linearGradient id="bannerAmberRust" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFB347" />
+      <stop offset="45%" stop-color="#FF7A33" />
+      <stop offset="80%" stop-color="#D94025" />
+      <stop offset="100%" stop-color="#9E2A18" />
+    </linearGradient>
+
+    <linearGradient id="bannerGold" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#E28743" />
+      <stop offset="60%" stop-color="#F7C06D" />
+      <stop offset="100%" stop-color="#FFECCC" />
+    </linearGradient>
+
+    <filter id="bannerGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="12" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="360" rx="24" fill="url(#bannerBg)" stroke="#232733" stroke-width="2"/>
+
+  <!-- Left Side: Emblem (Hourglass + Dune Causal Matrix) -->
+  <g transform="translate(180, 180) scale(0.72)">
+    <circle cx="0" cy="0" r="130" fill="#FF7A33" opacity="0.12" filter="url(#bannerGlow)" />
+    
+    <!-- Outer Hex Shield -->
+    <polygon points="0,-160 138,-80 138,80 0,160 -138,80 -138,-80"
+             fill="none" stroke="#2D3342" stroke-width="6" stroke-linejoin="round" opacity="0.5"/>
+
+    <!-- Upper Chamber -->
+    <path d="M -100,-100 L 100,-100 L 0,-6 Z"
+          fill="url(#bannerAmberRust)" fill-opacity="0.22" stroke="url(#bannerAmberRust)" stroke-width="5" stroke-linejoin="round"/>
+    
+    <!-- Attention Layer Bars -->
+    <line x1="-75" y1="-75" x2="75" y2="-75" stroke="url(#bannerGold)" stroke-width="3" opacity="0.8"/>
+    <line x1="-50" y1="-50" x2="50" y2="-50" stroke="url(#bannerGold)" stroke-width="3" opacity="0.8"/>
+    <line x1="-25" y1="-25" x2="25" y2="-25" stroke="url(#bannerGold)" stroke-width="3" opacity="0.8"/>
+
+    <!-- Center Node -->
+    <circle cx="0" cy="-6" r="9" fill="#FFECCC" filter="url(#bannerGlow)"/>
+    <circle cx="0" cy="-6" r="4" fill="#FFFFFF" />
+
+    <!-- Lower Chamber -->
+    <path d="M 0,-6 L 100,100 L -100,100 Z"
+          fill="url(#bannerAmberRust)" fill-opacity="0.25" stroke="url(#bannerAmberRust)" stroke-width="5" stroke-linejoin="round"/>
+
+    <!-- Falling Grains -->
+    <circle cx="0" cy="18" r="4.5" fill="#FFECCC"/>
+    <circle cx="0" cy="38" r="5" fill="#F7C06D"/>
+    <circle cx="-16" cy="60" r="5" fill="#FF7A33"/>
+    <circle cx="16" cy="60" r="5" fill="#FFB347"/>
+    <circle cx="-45" cy="85" r="5.5" fill="#D94025"/>
+    <circle cx="0" cy="85" r="6" fill="#F7C06D"/>
+    <circle cx="45" cy="85" r="5.5" fill="#D94025"/>
+
+    <!-- Sweeping S Wave -->
+    <path d="M -115,-40 C -80,-5 -40,30 0,-6 C 40,-45 80,-5 115,30"
+          fill="none" stroke="url(#bannerGold)" stroke-width="3.5" stroke-linecap="round" opacity="0.85"/>
+  </g>
+
+  <!-- Vertical Divider Line -->
+  <line x1="330" y1="60" x2="330" y2="300" stroke="#252A36" stroke-width="2" />
+
+  <!-- Right Side: Wordmark & Typography -->
+  <g transform="translate(370, 0)">
+    <text x="0" y="145" 
+          font-family="system-ui, -apple-system, 'SF Pro Display', 'Inter', Roboto, sans-serif" 
+          font-weight="900" 
+          font-size="62" 
+          fill="#FFFFFF" 
+          letter-spacing="8">SANDYRUST</text>
+    
+    <text x="0" y="195" 
+          font-family="'SF Mono', 'Fira Code', 'Consolas', monospace" 
+          font-weight="700" 
+          font-size="18" 
+          fill="#FF7A33" 
+          letter-spacing="4">STANDALONE PURE-RUST TRANSFORMER</text>
+    
+    <text x="0" y="240" 
+          font-family="system-ui, -apple-system, sans-serif" 
+          font-weight="400" 
+          font-size="16" 
+          fill="#9DA7BA">
+      Zero external crates • #![forbid(unsafe_code)] • 31/31 Verified Gates • 17 Modular Extensions
+    </text>
+
+    <!-- Pill Badges -->
+    <g transform="translate(0, 265)">
+      <!-- Badge 1 -->
+      <rect x="0" y="0" width="130" height="28" rx="6" fill="#1C212B" stroke="#2D3545" stroke-width="1.2"/>
+      <text x="65" y="18" font-family="monospace" font-size="11" font-weight="600" fill="#FFB347" text-anchor="middle">std::only</text>
+
+      <!-- Badge 2 -->
+      <rect x="142" y="0" width="175" height="28" rx="6" fill="#1C212B" stroke="#2D3545" stroke-width="1.2"/>
+      <text x="229" y="18" font-family="monospace" font-size="11" font-weight="600" fill="#48BB78" text-anchor="middle">forbid(unsafe_code)</text>
+
+      <!-- Badge 3 -->
+      <rect x="329" y="0" width="150" height="28" rx="6" fill="#1C212B" stroke="#2D3545" stroke-width="1.2"/>
+      <text x="404" y="18" font-family="monospace" font-size="11" font-weight="600" fill="#63B3ED" text-anchor="middle">P = 886,272 (exact)</text>
+
+      <!-- Badge 4 -->
+      <rect x="491" y="0" width="140" height="28" rx="6" fill="#1C212B" stroke="#2D3545" stroke-width="1.2"/>
+      <text x="561" y="18" font-family="monospace" font-size="11" font-weight="600" fill="#9F7AEA" text-anchor="middle">17/17 Extensions</text>
+    </g>
+  </g>
+</svg>
