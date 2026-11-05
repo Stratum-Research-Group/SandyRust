@@ -8,7 +8,7 @@
   "implemented_check": "Two-sided finite-difference gradcheck in FP64 across coordinate probes including repeated tokens",
   "prerequisites": "f64 model parameters and forward pass",
   "exclusions": "Single-sided finite differences",
-  "revision": "057546c",
+  "revision": "369e023",
   "dirty_state": false,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
@@ -22,5 +22,5 @@
   "observed": "Ok(GradCheckReport { checked: 456, failures: 0, max_abs_err: 9.148888296473326e-9, max_rel_err: 0.0031553776282280135 })",
   "tolerance_atol": 0.00001,
   "tolerance_rtol": 0.001,
-  "execution_time_ms": 6355
+  "execution_time_ms": 6296
 }

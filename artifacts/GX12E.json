@@ -8,7 +8,7 @@
   "implemented_check": "Exact entropy fixtures + controller bounds clamp + k=0.0 bitwise match + typed error validation",
   "prerequisites": "Config::reference_v2",
   "exclusions": "None",
-  "revision": "057546c",
+  "revision": "369e023",
   "dirty_state": false,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
@@ -22,5 +22,5 @@
   "observed": "k0_parity=true, entropy_fixtures=true, bounds=true, errs=true, nan_first=true, fixed(d1=0.81,d2=1.00,rep=0.20) adapt(d1=0.62,d2=0.94,rep=0.29)",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 152
+  "execution_time_ms": 160
 }
