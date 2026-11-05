@@ -8,8 +8,8 @@
   "implemented_check": "Four task generators + family-split leakage test + hand-worked metric tables + bootstrap reproducibility",
   "prerequisites": "Config::reference_v2",
   "exclusions": "None",
-  "revision": "c0ce074",
-  "dirty_state": true,
+  "revision": "bfbfe7c",
+  "dirty_state": false,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo test --test test_x14_eval",
@@ -22,5 +22,5 @@
   "observed": "gen_ok=true, repeat_ok=true, splits_ok=true, perfect_ok=true, always_flip_ok=true, bs_ok=true",
   "tolerance_atol": 0,
   "tolerance_rtol": 0,
-  "execution_time_ms": 13
+  "execution_time_ms": 12
 }

@@ -8,8 +8,8 @@
   "implemented_check": "layout_bijection, rotation_layout_equivalence, yarn_frequency_bands, yarn_temperature_factor, vector_norm_preservation, context_boundary_fixtures_256, config_enforcement",
   "prerequisites": "reference_v2, G4, G5, G6, G14",
   "exclusions": "none",
-  "revision": "0e1217c",
-  "dirty_state": true,
+  "revision": "bfbfe7c",
+  "dirty_state": false,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
   "command": "cargo test --test test_x4_rope",
@@ -22,5 +22,5 @@
   "observed": "layout_bijection: vec=true, matrix=true (ok=true); rotation_layout_equivalence: max_diff=0.00e0 (ok=true); yarn_frequency_bands: high_unscaled=true, low_scaled=true, ramp=true (ok=true); yarn_temperature_factor: factor=0.937149, expected=0.937149 (ok=true); vector_norm_preservation: max_norm_diff=1.13e-7 (ok=true); context_boundary_fixtures_256: pos=255, first=-0.0255, last=-0.6630, sum=-6.7801 (ok=true); config_enforcement: default=true, yarn=true, linear=true, reject_unenabled=true (ok=true)",
   "tolerance_atol": 0.00001,
   "tolerance_rtol": 0.0001,
-  "execution_time_ms": 13
+  "execution_time_ms": 12
 }
