@@ -8,7 +8,7 @@
   "implemented_check": "GX17-0 baseline untouched; GX17-1 negative; GX17-2 fuzz; GX17-3 dtypes; GX17-4 mapping; GX17-5 parity; GX17-6 identity; GX17-7 memory; GX17-8 BPE; GX17-9 generation",
   "prerequisites": "Pure-Rust safetensors reader, RIMP checkpoint format, HuggingFace BPE tokenizer, and parity checker",
   "exclusions": "Regression, identity bypass, or baseline behavioral mutation",
-  "revision": "368480d",
+  "revision": "23f0aa7",
   "dirty_state": false,
   "toolchain": "rustc-1.85.0-x86_64-unknown-linux-gnu",
   "target": "x86_64-unknown-linux-gnu",
