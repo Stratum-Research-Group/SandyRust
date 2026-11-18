@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.jpg" alt="SandyRust — Stratum Research Group" width="700" />
+</p>
+
 # SandyRust: Pure-Rust Transformer & Modular Deep Learning Laboratory
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
