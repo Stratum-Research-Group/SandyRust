@@ -8,7 +8,7 @@
   "implemented_check": "numerical_parity_shapes, strided_and_transposed_parity, batched_parity, multithread_determinism, wall_clock_benchmark",
   "prerequisites": "reference_v2, G2, G14",
   "exclusions": "none",
-  "revision": "9293e4c",
+  "revision": "b0e404d",
   "dirty_state": true,
   "toolchain": "rustc 1.98.1 (48a229cea 2026-09-01)",
   "target": "x86_64-unknown-linux-gnu",
@@ -19,8 +19,8 @@
   "config": "gemm_opt_v2",
   "fixture_hash": "gemm-tiled-v1",
   "expected": "componentwise parity <= 1e-5 + 1e-4*|y| on standard, odd, strided, and batched inputs; deterministic multithreading; wall-clock benchmark",
-  "observed": "numerical_parity_shapes: max_err=0.00e0 (ok=true); strided_and_transposed_parity: trans_a_err=0.00e0, trans_b_err=0.00e0 (ok=true); batched_parity: err=0.00e0 (ok=true); multithread_determinism: err=0.00e0 (ok=true); wall_clock_benchmark: ref=993us, opt=864us, speedup=1.15x (ok=true)",
+  "observed": "numerical_parity_shapes: max_err=0.00e0 (ok=true); strided_and_transposed_parity: trans_a_err=0.00e0, trans_b_err=0.00e0 (ok=true); batched_parity: err=0.00e0 (ok=true); multithread_determinism: err=0.00e0 (ok=true); wall_clock_benchmark: ref=3153us, opt=1692us, speedup=1.86x (ok=true)",
   "tolerance_atol": 0.00001,
   "tolerance_rtol": 0.0001,
-  "execution_time_ms": 15
+  "execution_time_ms": 35
 }

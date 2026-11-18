@@ -105,9 +105,7 @@ fn test_x15_frozen_base_invariant() {
     // Mutate adapter
     for l in &mut adapter.layers {
         for m in l.values_mut() {
-            for v in &mut m.b {
-                *v = 0.123;
-            }
+            m.b.fill(0.123);
         }
     }
 
@@ -129,9 +127,7 @@ fn test_x15_merge_equivalence() {
 
     for l in &mut adapter.layers {
         for m in l.values_mut() {
-            for v in &mut m.b {
-                *v = 0.05;
-            }
+            m.b.fill(0.05);
         }
     }
 

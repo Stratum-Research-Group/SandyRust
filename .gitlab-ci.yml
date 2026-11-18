@@ -9,6 +9,15 @@ default:
     - rustc --version
     - cargo --version
 
+variables:
+  CARGO_HOME: "${CI_PROJECT_DIR}/.cargo"
+
+cache:
+  key: "${CI_COMMIT_REF_SLUG}"
+  paths:
+    - .cargo/
+    - target/
+
 lint:
   stage: lint
   before_script:
@@ -16,12 +25,12 @@ lint:
     - cargo --version
     - rustup component add clippy
   script:
-    - cargo clippy --all-targets --offline --locked -- -D warnings
+    - cargo clippy --all-targets --locked -- -D warnings
 
 test:
   stage: test
   script:
-    - cargo test --offline --locked
+    - cargo test --release --locked
 
 verify:
   stage: verify

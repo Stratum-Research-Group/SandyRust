@@ -640,9 +640,7 @@ pub fn gx15() -> crate::gates::GateReport {
     let mut trained_adapter = adapter.clone();
     for l in &mut trained_adapter.layers {
         for m in l.values_mut() {
-            for v in &mut m.b {
-                *v = 0.05;
-            }
+            m.b.fill(0.05);
         }
     }
     trained_adapter.header.payload_hash = trained_adapter.compute_payload_hash();

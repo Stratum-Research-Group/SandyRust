@@ -1,0 +1,37 @@
+name: SandyRust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Clippy Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+        with:
+          components: clippy
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: Test Suite (Release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - name: Run Tests
+        run: cargo test --release --locked
+
+  verify:
+    name: Gate Verification (G1-G14, GX1-GX17)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - name: Verify All 31 Quality Gates
+        run: cargo run --release -- verify
